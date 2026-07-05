@@ -1,9 +1,96 @@
+using Confluent.Kafka;
+using Microsoft.Extensions.Options;
+using conversation_orchestrator.AgentRuntime;
+using conversation_orchestrator.Audit;
+using conversation_orchestrator.ChannelBff;
+using conversation_orchestrator.Configuration;
+using conversation_orchestrator.Events;
+using conversation_orchestrator.Handoff;
+using conversation_orchestrator.Messages;
+using conversation_orchestrator.Sessions;
+
 var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.
 // Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
+
+builder.Services.AddOptions<ConversationSessionOptions>()
+    .Bind(builder.Configuration.GetSection(ConversationSessionOptions.SectionName));
+builder.Services.AddOptions<AgentRuntimeOptions>()
+    .Bind(builder.Configuration.GetSection(AgentRuntimeOptions.SectionName));
+builder.Services.AddOptions<ChannelBffOptions>()
+    .Bind(builder.Configuration.GetSection(ChannelBffOptions.SectionName));
+builder.Services.AddOptions<HandoffServiceOptions>()
+    .Bind(builder.Configuration.GetSection(HandoffServiceOptions.SectionName));
+builder.Services.AddOptions<AuditServiceOptions>()
+    .Bind(builder.Configuration.GetSection(AuditServiceOptions.SectionName));
+builder.Services.AddOptions<KafkaOptions>()
+    .Bind(builder.Configuration.GetSection(KafkaOptions.SectionName));
+
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddSingleton<IConversationSessionStore, InMemoryConversationSessionStore>();
+
+builder.Services.AddHttpClient<IAgentRuntimeClient, AgentRuntimeClient>((sp, client) =>
+    {
+        var options = sp.GetRequiredService<IOptions<AgentRuntimeOptions>>().Value;
+        client.BaseAddress = new Uri(options.BaseUrl);
+    })
+    .AddStandardResilienceHandler(options =>
+    {
+        options.Retry.MaxRetryAttempts = 2;
+        options.Retry.Delay = TimeSpan.FromMilliseconds(200);
+    });
+
+builder.Services.AddHttpClient<IChannelReplyClient, ChannelReplyClient>((sp, client) =>
+    {
+        var options = sp.GetRequiredService<IOptions<ChannelBffOptions>>().Value;
+        client.BaseAddress = new Uri(options.BaseUrl);
+    })
+    .AddStandardResilienceHandler(options =>
+    {
+        options.Retry.MaxRetryAttempts = 2;
+        options.Retry.Delay = TimeSpan.FromMilliseconds(200);
+    });
+
+builder.Services.AddHttpClient<IHandoffServiceClient, HandoffServiceClient>((sp, client) =>
+    {
+        var options = sp.GetRequiredService<IOptions<HandoffServiceOptions>>().Value;
+        client.BaseAddress = new Uri(options.BaseUrl);
+    })
+    .AddStandardResilienceHandler(options =>
+    {
+        options.Retry.MaxRetryAttempts = 2;
+        options.Retry.Delay = TimeSpan.FromMilliseconds(200);
+    });
+
+builder.Services.AddHttpClient<IAuditServiceClient, AuditServiceClient>((sp, client) =>
+    {
+        var options = sp.GetRequiredService<IOptions<AuditServiceOptions>>().Value;
+        client.BaseAddress = new Uri(options.BaseUrl);
+    })
+    .AddStandardResilienceHandler(options =>
+    {
+        options.Retry.MaxRetryAttempts = 2;
+        options.Retry.Delay = TimeSpan.FromMilliseconds(200);
+    });
+
+builder.Services.AddSingleton<IProducer<string, string>>(sp =>
+{
+    var options = sp.GetRequiredService<IOptions<KafkaOptions>>().Value;
+    var config = new ProducerConfig { BootstrapServers = options.BootstrapServers };
+    return new ProducerBuilder<string, string>(config).Build();
+});
+builder.Services.AddSingleton<IConversationEventPublisher, KafkaConversationEventPublisher>();
+
+builder.Logging.Configure(options =>
+{
+    options.ActivityTrackingOptions = ActivityTrackingOptions.TraceId
+        | ActivityTrackingOptions.SpanId
+        | ActivityTrackingOptions.ParentId;
+});
+builder.Logging.AddSimpleConsole(options => options.IncludeScopes = true);
 
 var app = builder.Build();
 
@@ -16,29 +103,8 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 
-var summaries = new[]
-{
-    "Freezing", "Bracing", "Chilly", "Cool", "Mild", "Warm", "Balmy", "Hot", "Sweltering", "Scorching"
-};
-
-app.MapGet("/weatherforecast", () =>
-{
-    var forecast = Enumerable.Range(1, 5).Select(index =>
-        new WeatherForecast
-        (
-            DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
-            Random.Shared.Next(-20, 55),
-            summaries[Random.Shared.Next(summaries.Length)]
-        ))
-        .ToArray();
-    return forecast;
-})
-.WithName("GetWeatherForecast")
-.WithOpenApi();
+app.MapMessageIngestionEndpoints();
 
 app.Run();
 
-internal record WeatherForecast(DateOnly Date, int TemperatureC, string? Summary)
-{
-    public int TemperatureF => 32 + (int)(TemperatureC / 0.5556);
-}
+public partial class Program;
