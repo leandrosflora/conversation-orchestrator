@@ -1,13 +1,13 @@
 using Confluent.Kafka;
 using Microsoft.Extensions.Options;
-using conversation_orchestrator.AgentRuntime;
-using conversation_orchestrator.Audit;
-using conversation_orchestrator.ChannelBff;
+using conversation_orchestrator.Adapters.Inbound.Http;
+using conversation_orchestrator.Adapters.Outbound.Http;
+using conversation_orchestrator.Adapters.Outbound.Messaging;
+using conversation_orchestrator.Adapters.Outbound.Persistence;
+using conversation_orchestrator.Application.Ports.Inbound;
+using conversation_orchestrator.Application.Ports.Outbound;
+using conversation_orchestrator.Application.UseCases;
 using conversation_orchestrator.Configuration;
-using conversation_orchestrator.Events;
-using conversation_orchestrator.Handoff;
-using conversation_orchestrator.Messages;
-using conversation_orchestrator.Sessions;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -83,6 +83,8 @@ builder.Services.AddSingleton<IProducer<string, string>>(sp =>
     return new ProducerBuilder<string, string>(config).Build();
 });
 builder.Services.AddSingleton<IConversationEventPublisher, KafkaConversationEventPublisher>();
+
+builder.Services.AddScoped<IIngestMessageUseCase, IngestMessageUseCase>();
 
 builder.Logging.Configure(options =>
 {
