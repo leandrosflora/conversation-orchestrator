@@ -76,15 +76,15 @@ public class IngestMessageUseCase(
             await channelReplyClient.SendReplyAsync(conversationId, result.ReplyText, cancellationToken);
         }
 
-        await auditClient.RecordJourneyEventAsync(
-            new JourneyAuditEvent
-            {
-                ConversationId = conversationId,
-                Intent = result.Intent,
-                Outcome = result.RequiresHandoff ? "handoff" : "processed",
-                Timestamp = DateTimeOffset.UtcNow
-            },
-            cancellationToken);
+        //await auditClient.RecordJourneyEventAsync(
+        //    new JourneyAuditEvent
+        //    {
+        //        ConversationId = conversationId,
+        //        Intent = result.Intent,
+        //        Outcome = result.RequiresHandoff ? "handoff" : "processed",
+        //        Timestamp = DateTimeOffset.UtcNow
+        //    },
+        //    cancellationToken);
 
         logger.LogInformation(
             "Processed message {MessageId} for conversation {ConversationId}: outcome={Outcome}",
