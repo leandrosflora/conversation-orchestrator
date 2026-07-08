@@ -1,5 +1,7 @@
 using Confluent.Kafka;
 using Microsoft.Extensions.Options;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 using conversation_orchestrator.Adapters.Inbound.Http;
 using conversation_orchestrator.Adapters.Outbound.Http;
 using conversation_orchestrator.Adapters.Outbound.Messaging;
@@ -28,6 +30,20 @@ builder.Services.AddOptions<AuditServiceOptions>()
     .Bind(builder.Configuration.GetSection(AuditServiceOptions.SectionName));
 builder.Services.AddOptions<KafkaOptions>()
     .Bind(builder.Configuration.GetSection(KafkaOptions.SectionName));
+builder.Services.AddOptions<OtelOptions>()
+    .Bind(builder.Configuration.GetSection(OtelOptions.SectionName));
+
+// Exports the ASP.NET Core + outgoing HttpClient Activities that ActivityTrackingOptions
+// below already correlates in logs (TraceId/SpanId/ParentId) to Jaeger via OTLP, so the
+// same trace that ties log lines together also shows up as a real distributed trace.
+var otelEndpoint = builder.Configuration.GetSection(OtelOptions.SectionName).Get<OtelOptions>()?.OtlpEndpoint
+    ?? "http://localhost:4317";
+builder.Services.AddOpenTelemetry()
+    .ConfigureResource(resource => resource.AddService("conversation-orchestrator"))
+    .WithTracing(tracing => tracing
+        .AddAspNetCoreInstrumentation()
+        .AddHttpClientInstrumentation()
+        .AddOtlpExporter(otlp => otlp.Endpoint = new Uri(otelEndpoint)));
 
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<IConversationSessionStore, InMemoryConversationSessionStore>();
