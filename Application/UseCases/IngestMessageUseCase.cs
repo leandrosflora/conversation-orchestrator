@@ -6,6 +6,7 @@ namespace conversation_orchestrator.Application.UseCases;
 
 public class IngestMessageUseCase(
     IConversationSessionStore sessionStore,
+    IMessageDedupeStore dedupeStore,
     IAgentRuntimeClient agentRuntimeClient,
     IChannelReplyClient channelReplyClient,
     IConversationEventPublisher eventPublisher,
@@ -18,6 +19,21 @@ public class IngestMessageUseCase(
     public async Task ExecuteAsync(InboundChannelMessage message, CancellationToken cancellationToken)
     {
         var conversationId = message.ConversationId!;
+
+        // whatsapp-bff's own HTTP-retry and Kafka-consumer-retry against POST /messages can both
+        // redeliver the same MessageId while this use case is still working the first attempt
+        // (real OpenAI + MCP tool round trips routinely exceed those callers' timeouts). Without
+        // this, each redelivery re-ran the whole agent loop - duplicate OpenAI cost and duplicate
+        // side effects (Kafka events, handoff requests, replies) for one inbound message.
+        if (!dedupeStore.TryMarkProcessed(message.MessageId!))
+        {
+            logger.LogInformation(
+                "Dropped duplicate message {MessageId} for conversation {ConversationId}",
+                message.MessageId,
+                conversationId);
+            return;
+        }
+
         var session = sessionStore.GetOrCreate(conversationId);
         var previousStage = session.JourneyStage;
 
