@@ -18,8 +18,6 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
-builder.Services.AddOptions<ConversationSessionOptions>()
-    .Bind(builder.Configuration.GetSection(ConversationSessionOptions.SectionName));
 builder.Services.AddOptions<AgentRuntimeOptions>()
     .Bind(builder.Configuration.GetSection(AgentRuntimeOptions.SectionName));
 builder.Services.AddOptions<ChannelBffOptions>()
@@ -28,6 +26,8 @@ builder.Services.AddOptions<HandoffServiceOptions>()
     .Bind(builder.Configuration.GetSection(HandoffServiceOptions.SectionName));
 builder.Services.AddOptions<AuditServiceOptions>()
     .Bind(builder.Configuration.GetSection(AuditServiceOptions.SectionName));
+builder.Services.AddOptions<ConversationMemoryOptions>()
+    .Bind(builder.Configuration.GetSection(ConversationMemoryOptions.SectionName));
 builder.Services.AddOptions<KafkaOptions>()
     .Bind(builder.Configuration.GetSection(KafkaOptions.SectionName));
 builder.Services.AddOptions<OtelOptions>()
@@ -46,7 +46,6 @@ builder.Services.AddOpenTelemetry()
         .AddOtlpExporter(otlp => otlp.Endpoint = new Uri(otelEndpoint)));
 
 builder.Services.AddSingleton(TimeProvider.System);
-builder.Services.AddSingleton<IConversationSessionStore, InMemoryConversationSessionStore>();
 builder.Services.AddMemoryCache();
 builder.Services.AddSingleton<IMessageDedupeStore, InMemoryMessageDedupeStore>();
 
@@ -94,6 +93,17 @@ builder.Services.AddHttpClient<IHandoffServiceClient, HandoffServiceClient>((sp,
 builder.Services.AddHttpClient<IAuditServiceClient, AuditServiceClient>((sp, client) =>
     {
         var options = sp.GetRequiredService<IOptions<AuditServiceOptions>>().Value;
+        client.BaseAddress = new Uri(options.BaseUrl);
+    })
+    .AddStandardResilienceHandler(options =>
+    {
+        options.Retry.MaxRetryAttempts = 2;
+        options.Retry.Delay = TimeSpan.FromMilliseconds(200);
+    });
+
+builder.Services.AddHttpClient<IConversationMemoryClient, ConversationMemoryClient>((sp, client) =>
+    {
+        var options = sp.GetRequiredService<IOptions<ConversationMemoryOptions>>().Value;
         client.BaseAddress = new Uri(options.BaseUrl);
     })
     .AddStandardResilienceHandler(options =>

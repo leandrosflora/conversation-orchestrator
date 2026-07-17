@@ -5,7 +5,7 @@ using conversation_orchestrator.Domain;
 namespace conversation_orchestrator.Application.UseCases;
 
 public class IngestMessageUseCase(
-    IConversationSessionStore sessionStore,
+    IConversationMemoryClient conversationMemoryClient,
     IMessageDedupeStore dedupeStore,
     IAgentRuntimeClient agentRuntimeClient,
     IChannelReplyClient channelReplyClient,
@@ -15,6 +15,15 @@ public class IngestMessageUseCase(
     ILogger<IngestMessageUseCase> logger) : IIngestMessageUseCase
 {
     private const string ProcessedStage = "processed";
+
+    // conversation-memory-service calls are best-effort durability side-effects (see
+    // IConversationMemoryClient) - they must not be cancelled just because the inbound
+    // HTTP caller (whatsapp-bff's IOrchestratorClient, a documented 10s AttemptTimeout) gave
+    // up waiting on a slow-but-otherwise-successful request (e.g. a long Agent Runtime/OpenAI
+    // round trip). Each gets its own short-lived timeout instead of inheriting the request's
+    // cancellationToken, so a real conversation-memory-service outage still degrades quickly
+    // rather than hanging, but a merely-slow overall request doesn't silently drop persistence.
+    private static readonly TimeSpan MemoryCallTimeout = TimeSpan.FromSeconds(5);
 
     public async Task ExecuteAsync(InboundChannelMessage message, CancellationToken cancellationToken)
     {
@@ -34,7 +43,17 @@ public class IngestMessageUseCase(
             return;
         }
 
-        var session = sessionStore.GetOrCreate(conversationId);
+        using (var cts = new CancellationTokenSource(MemoryCallTimeout))
+        {
+            await conversationMemoryClient.AppendMessageAsync(
+                conversationId, "user", message.Text ?? string.Empty, message.MessageId, cts.Token);
+        }
+
+        ConversationSession session;
+        using (var cts = new CancellationTokenSource(MemoryCallTimeout))
+        {
+            session = await conversationMemoryClient.GetOrCreateSessionAsync(conversationId, cts.Token);
+        }
         var previousStage = session.JourneyStage;
 
         var agentRequest = new AgentRuntimeRequest
@@ -77,6 +96,11 @@ public class IngestMessageUseCase(
                 cancellationToken);
         }
 
+        using (var cts = new CancellationTokenSource(MemoryCallTimeout))
+        {
+            await conversationMemoryClient.SaveSessionAsync(session, cts.Token);
+        }
+
         if (result.RequiresHandoff)
         {
             await handoffClient.RequestHandoffAsync(
@@ -90,6 +114,10 @@ public class IngestMessageUseCase(
         else if (!string.IsNullOrWhiteSpace(result.ReplyText))
         {
             await channelReplyClient.SendReplyAsync(conversationId, result.ReplyText, cancellationToken);
+
+            using var cts = new CancellationTokenSource(MemoryCallTimeout);
+            await conversationMemoryClient.AppendMessageAsync(
+                conversationId, "assistant", result.ReplyText, externalMessageId: null, cts.Token);
         }
 
         //await auditClient.RecordJourneyEventAsync(
