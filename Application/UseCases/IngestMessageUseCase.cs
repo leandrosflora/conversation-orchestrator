@@ -1,6 +1,8 @@
+using System.Diagnostics;
 using conversation_orchestrator.Application.Ports.Inbound;
 using conversation_orchestrator.Application.Ports.Outbound;
 using conversation_orchestrator.Domain;
+using conversation_orchestrator.Platform;
 
 namespace conversation_orchestrator.Application.UseCases;
 
@@ -12,6 +14,8 @@ public class IngestMessageUseCase(
     IConversationEventPublisher eventPublisher,
     IHandoffServiceClient handoffClient,
     IAuditServiceClient auditClient,
+    TenantContext tenantContext,
+    PlatformMetrics metrics,
     ILogger<IngestMessageUseCase> logger) : IIngestMessageUseCase
 {
     private const string ProcessedStage = "processed";
@@ -21,25 +25,20 @@ public class IngestMessageUseCase(
         InboundChannelMessage message,
         CancellationToken cancellationToken)
     {
+        var stopwatch = Stopwatch.StartNew();
         var messageId = message.MessageId!;
         var conversationId = message.ConversationId!;
+        var tenantId = tenantContext.TenantId;
 
         var acquireResult = await inboxStore.TryAcquireAsync(messageId, conversationId, cancellationToken);
         if (acquireResult == InboxAcquireResult.Completed)
         {
-            logger.LogInformation(
-                "Message {MessageId} for conversation {ConversationId} was already completed",
-                messageId,
-                conversationId);
+            metrics.Increment("orchestrator_inbox_duplicates_total", ("state", "completed"));
             return IngestMessageResult.AlreadyCompleted;
         }
-
         if (acquireResult == InboxAcquireResult.InProgress)
         {
-            logger.LogInformation(
-                "Message {MessageId} for conversation {ConversationId} is already being processed",
-                messageId,
-                conversationId);
+            metrics.Increment("orchestrator_inbox_duplicates_total", ("state", "processing"));
             return IngestMessageResult.InProgress;
         }
 
@@ -58,22 +57,22 @@ public class IngestMessageUseCase(
             }
 
             var previousStage = session.JourneyStage;
-            var agentRequest = new AgentRuntimeRequest
-            {
-                ConversationId = conversationId,
-                MessageType = message.Type.ToString(),
-                Text = message.Text,
-                JourneyStage = session.JourneyStage,
-                LastIntent = session.LastIntent
-            };
-
-            var result = await agentRuntimeClient.ProcessAsync(agentRequest, cancellationToken);
+            var result = await agentRuntimeClient.ProcessAsync(
+                new AgentRuntimeRequest
+                {
+                    TenantId = tenantId,
+                    ConversationId = conversationId,
+                    MessageType = message.Type.ToString(),
+                    Text = message.Text,
+                    JourneyStage = session.JourneyStage,
+                    LastIntent = session.LastIntent
+                },
+                cancellationToken);
 
             if (result.Intent is not null)
             {
                 session.LastIntent = result.Intent;
                 session.JourneyStage = ProcessedStage;
-
                 await eventPublisher.PublishIntentDetectedAsync(
                     new IntentDetectedEvent
                     {
@@ -103,8 +102,10 @@ public class IngestMessageUseCase(
                 await conversationMemoryClient.SaveSessionAsync(session, cts.Token);
             }
 
+            var outcome = "processed";
             if (result.RequiresHandoff)
             {
+                outcome = "handoff";
                 await handoffClient.RequestHandoffAsync(
                     new HandoffRequest
                     {
@@ -113,11 +114,12 @@ public class IngestMessageUseCase(
                     },
                     $"handoff:{messageId}",
                     cancellationToken);
+                metrics.Increment("orchestrator_handoffs_total",
+                    ("reason", result.HandoffReason ?? "unspecified"));
             }
             else if (!string.IsNullOrWhiteSpace(result.ReplyText))
             {
                 await channelReplyClient.SendReplyAsync(conversationId, result.ReplyText, cancellationToken);
-
                 using var cts = new CancellationTokenSource(SideEffectCallTimeout);
                 await conversationMemoryClient.AppendMessageAsync(
                     conversationId, "assistant", result.ReplyText, externalMessageId: null, cts.Token);
@@ -130,7 +132,7 @@ public class IngestMessageUseCase(
                     {
                         ConversationId = conversationId,
                         Intent = result.Intent,
-                        Outcome = result.RequiresHandoff ? "handoff" : "processed",
+                        Outcome = outcome,
                         Timestamp = DateTimeOffset.UtcNow
                     },
                     $"audit:{messageId}",
@@ -138,25 +140,27 @@ public class IngestMessageUseCase(
             }
 
             await inboxStore.MarkCompletedAsync(messageId, CancellationToken.None);
-
-            logger.LogInformation(
-                "Processed message {MessageId} for conversation {ConversationId}: outcome={Outcome}",
-                messageId,
-                conversationId,
-                result.RequiresHandoff ? "handoff" : "processed");
-
+            metrics.Increment("orchestrator_journey_outcomes_total",
+                ("outcome", outcome), ("intent", result.Intent ?? "unknown"));
             return IngestMessageResult.Accepted;
         }
         catch (Exception ex)
         {
+            metrics.Increment("orchestrator_processing_failures_total",
+                ("exception", ex.GetType().Name));
             logger.LogError(
                 ex,
-                "Message {MessageId} for conversation {ConversationId} failed before Inbox completion",
+                "Message {MessageId} for tenant {TenantId} conversation {ConversationId} failed before Inbox completion",
                 messageId,
+                tenantId,
                 conversationId);
-
             await MarkFailedBestEffortAsync(messageId, ex.GetType().Name);
             throw;
+        }
+        finally
+        {
+            stopwatch.Stop();
+            metrics.Observe("orchestrator_message_processing_duration_seconds", stopwatch.Elapsed.TotalSeconds);
         }
     }
 
