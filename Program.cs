@@ -80,14 +80,6 @@ builder.Services.AddHttpClient<IHandoffServiceClient, HandoffServiceClient>((sp,
     {
         options.Retry.MaxRetryAttempts = 2;
         options.Retry.Delay = TimeSpan.FromMilliseconds(200);
-        // handoff-service has no repo in this workspace yet, so every call fails by design
-        // (see docker-compose.yml). Keep attempts short so HandoffServiceClient's caught
-        // failure returns well inside the 10s budget the whatsapp-bff caller enforces on
-        // POST /messages - otherwise this unreachable dependency stalls every conversation
-        // that requires handoff, and whatsapp-bff's Kafka consumer seeks back and retries
-        // the same message forever, blocking everything queued behind it.
-        options.AttemptTimeout.Timeout = TimeSpan.FromSeconds(1);
-        options.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(3);
     });
 
 builder.Services.AddHttpClient<IAuditServiceClient, AuditServiceClient>((sp, client) =>

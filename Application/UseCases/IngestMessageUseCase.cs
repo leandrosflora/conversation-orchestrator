@@ -16,14 +16,15 @@ public class IngestMessageUseCase(
 {
     private const string ProcessedStage = "processed";
 
-    // conversation-memory-service calls are best-effort durability side-effects (see
-    // IConversationMemoryClient) - they must not be cancelled just because the inbound
-    // HTTP caller (whatsapp-bff's IOrchestratorClient, a documented 10s AttemptTimeout) gave
-    // up waiting on a slow-but-otherwise-successful request (e.g. a long Agent Runtime/OpenAI
-    // round trip). Each gets its own short-lived timeout instead of inheriting the request's
-    // cancellationToken, so a real conversation-memory-service outage still degrades quickly
-    // rather than hanging, but a merely-slow overall request doesn't silently drop persistence.
-    private static readonly TimeSpan MemoryCallTimeout = TimeSpan.FromSeconds(5);
+    // conversation-memory-service and conversation-audit-service calls are best-effort
+    // durability side-effects (see IConversationMemoryClient/IAuditServiceClient) - they must
+    // not be cancelled just because the inbound HTTP caller (whatsapp-bff's IOrchestratorClient,
+    // a documented 10s AttemptTimeout) gave up waiting on a slow-but-otherwise-successful
+    // request (e.g. a long Agent Runtime/OpenAI round trip). Each gets its own short-lived
+    // timeout instead of inheriting the request's cancellationToken, so a real outage in either
+    // downstream still degrades quickly rather than hanging, but a merely-slow overall request
+    // doesn't silently drop persistence.
+    private static readonly TimeSpan SideEffectCallTimeout = TimeSpan.FromSeconds(5);
 
     public async Task ExecuteAsync(InboundChannelMessage message, CancellationToken cancellationToken)
     {
@@ -43,14 +44,14 @@ public class IngestMessageUseCase(
             return;
         }
 
-        using (var cts = new CancellationTokenSource(MemoryCallTimeout))
+        using (var cts = new CancellationTokenSource(SideEffectCallTimeout))
         {
             await conversationMemoryClient.AppendMessageAsync(
                 conversationId, "user", message.Text ?? string.Empty, message.MessageId, cts.Token);
         }
 
         ConversationSession session;
-        using (var cts = new CancellationTokenSource(MemoryCallTimeout))
+        using (var cts = new CancellationTokenSource(SideEffectCallTimeout))
         {
             session = await conversationMemoryClient.GetOrCreateSessionAsync(conversationId, cts.Token);
         }
@@ -96,7 +97,7 @@ public class IngestMessageUseCase(
                 cancellationToken);
         }
 
-        using (var cts = new CancellationTokenSource(MemoryCallTimeout))
+        using (var cts = new CancellationTokenSource(SideEffectCallTimeout))
         {
             await conversationMemoryClient.SaveSessionAsync(session, cts.Token);
         }
@@ -115,20 +116,23 @@ public class IngestMessageUseCase(
         {
             await channelReplyClient.SendReplyAsync(conversationId, result.ReplyText, cancellationToken);
 
-            using var cts = new CancellationTokenSource(MemoryCallTimeout);
+            using var cts = new CancellationTokenSource(SideEffectCallTimeout);
             await conversationMemoryClient.AppendMessageAsync(
                 conversationId, "assistant", result.ReplyText, externalMessageId: null, cts.Token);
         }
 
-        //await auditClient.RecordJourneyEventAsync(
-        //    new JourneyAuditEvent
-        //    {
-        //        ConversationId = conversationId,
-        //        Intent = result.Intent,
-        //        Outcome = result.RequiresHandoff ? "handoff" : "processed",
-        //        Timestamp = DateTimeOffset.UtcNow
-        //    },
-        //    cancellationToken);
+        using (var cts = new CancellationTokenSource(SideEffectCallTimeout))
+        {
+            await auditClient.RecordJourneyEventAsync(
+                new JourneyAuditEvent
+                {
+                    ConversationId = conversationId,
+                    Intent = result.Intent,
+                    Outcome = result.RequiresHandoff ? "handoff" : "processed",
+                    Timestamp = DateTimeOffset.UtcNow
+                },
+                cts.Token);
+        }
 
         logger.LogInformation(
             "Processed message {MessageId} for conversation {ConversationId}: outcome={Outcome}",
