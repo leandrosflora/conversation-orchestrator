@@ -6,7 +6,7 @@ namespace conversation_orchestrator.Application.UseCases;
 
 public class IngestMessageUseCase(
     IConversationMemoryClient conversationMemoryClient,
-    IMessageDedupeStore dedupeStore,
+    IMessageInboxStore inboxStore,
     IAgentRuntimeClient agentRuntimeClient,
     IChannelReplyClient channelReplyClient,
     IConversationEventPublisher eventPublisher,
@@ -15,129 +15,161 @@ public class IngestMessageUseCase(
     ILogger<IngestMessageUseCase> logger) : IIngestMessageUseCase
 {
     private const string ProcessedStage = "processed";
-
-    // conversation-memory-service and conversation-audit-service calls are best-effort
-    // durability side-effects (see IConversationMemoryClient/IAuditServiceClient) - they must
-    // not be cancelled just because the inbound HTTP caller (whatsapp-bff's IOrchestratorClient,
-    // a documented 10s AttemptTimeout) gave up waiting on a slow-but-otherwise-successful
-    // request (e.g. a long Agent Runtime/OpenAI round trip). Each gets its own short-lived
-    // timeout instead of inheriting the request's cancellationToken, so a real outage in either
-    // downstream still degrades quickly rather than hanging, but a merely-slow overall request
-    // doesn't silently drop persistence.
     private static readonly TimeSpan SideEffectCallTimeout = TimeSpan.FromSeconds(5);
 
-    public async Task ExecuteAsync(InboundChannelMessage message, CancellationToken cancellationToken)
+    public async Task<IngestMessageResult> ExecuteAsync(
+        InboundChannelMessage message,
+        CancellationToken cancellationToken)
     {
+        var messageId = message.MessageId!;
         var conversationId = message.ConversationId!;
 
-        // whatsapp-bff's own HTTP-retry and Kafka-consumer-retry against POST /messages can both
-        // redeliver the same MessageId while this use case is still working the first attempt
-        // (real OpenAI + MCP tool round trips routinely exceed those callers' timeouts). Without
-        // this, each redelivery re-ran the whole agent loop - duplicate OpenAI cost and duplicate
-        // side effects (Kafka events, handoff requests, replies) for one inbound message.
-        if (!dedupeStore.TryMarkProcessed(message.MessageId!))
+        var acquireResult = await inboxStore.TryAcquireAsync(messageId, conversationId, cancellationToken);
+        if (acquireResult == InboxAcquireResult.Completed)
         {
             logger.LogInformation(
-                "Dropped duplicate message {MessageId} for conversation {ConversationId}",
-                message.MessageId,
+                "Message {MessageId} for conversation {ConversationId} was already completed",
+                messageId,
                 conversationId);
-            return;
+            return IngestMessageResult.AlreadyCompleted;
         }
 
-        using (var cts = new CancellationTokenSource(SideEffectCallTimeout))
+        if (acquireResult == InboxAcquireResult.InProgress)
         {
-            await conversationMemoryClient.AppendMessageAsync(
-                conversationId, "user", message.Text ?? string.Empty, message.MessageId, cts.Token);
+            logger.LogInformation(
+                "Message {MessageId} for conversation {ConversationId} is already being processed",
+                messageId,
+                conversationId);
+            return IngestMessageResult.InProgress;
         }
 
-        ConversationSession session;
-        using (var cts = new CancellationTokenSource(SideEffectCallTimeout))
+        try
         {
-            session = await conversationMemoryClient.GetOrCreateSessionAsync(conversationId, cts.Token);
+            using (var cts = new CancellationTokenSource(SideEffectCallTimeout))
+            {
+                await conversationMemoryClient.AppendMessageAsync(
+                    conversationId, "user", message.Text ?? string.Empty, messageId, cts.Token);
+            }
+
+            ConversationSession session;
+            using (var cts = new CancellationTokenSource(SideEffectCallTimeout))
+            {
+                session = await conversationMemoryClient.GetOrCreateSessionAsync(conversationId, cts.Token);
+            }
+
+            var previousStage = session.JourneyStage;
+            var agentRequest = new AgentRuntimeRequest
+            {
+                ConversationId = conversationId,
+                MessageType = message.Type.ToString(),
+                Text = message.Text,
+                JourneyStage = session.JourneyStage,
+                LastIntent = session.LastIntent
+            };
+
+            var result = await agentRuntimeClient.ProcessAsync(agentRequest, cancellationToken);
+
+            if (result.Intent is not null)
+            {
+                session.LastIntent = result.Intent;
+                session.JourneyStage = ProcessedStage;
+
+                await eventPublisher.PublishIntentDetectedAsync(
+                    new IntentDetectedEvent
+                    {
+                        ConversationId = conversationId,
+                        Intent = result.Intent,
+                        Confidence = result.Confidence,
+                        DetectedAt = DateTimeOffset.UtcNow
+                    },
+                    cancellationToken);
+            }
+
+            if (session.JourneyStage != previousStage)
+            {
+                await eventPublisher.PublishConversationStateChangedAsync(
+                    new ConversationStateChangedEvent
+                    {
+                        ConversationId = conversationId,
+                        PreviousStage = previousStage,
+                        NewStage = session.JourneyStage,
+                        ChangedAt = DateTimeOffset.UtcNow
+                    },
+                    cancellationToken);
+            }
+
+            using (var cts = new CancellationTokenSource(SideEffectCallTimeout))
+            {
+                await conversationMemoryClient.SaveSessionAsync(session, cts.Token);
+            }
+
+            if (result.RequiresHandoff)
+            {
+                await handoffClient.RequestHandoffAsync(
+                    new HandoffRequest
+                    {
+                        ConversationId = conversationId,
+                        Reason = result.HandoffReason ?? "unspecified"
+                    },
+                    $"handoff:{messageId}",
+                    cancellationToken);
+            }
+            else if (!string.IsNullOrWhiteSpace(result.ReplyText))
+            {
+                await channelReplyClient.SendReplyAsync(conversationId, result.ReplyText, cancellationToken);
+
+                using var cts = new CancellationTokenSource(SideEffectCallTimeout);
+                await conversationMemoryClient.AppendMessageAsync(
+                    conversationId, "assistant", result.ReplyText, externalMessageId: null, cts.Token);
+            }
+
+            using (var cts = new CancellationTokenSource(SideEffectCallTimeout))
+            {
+                await auditClient.RecordJourneyEventAsync(
+                    new JourneyAuditEvent
+                    {
+                        ConversationId = conversationId,
+                        Intent = result.Intent,
+                        Outcome = result.RequiresHandoff ? "handoff" : "processed",
+                        Timestamp = DateTimeOffset.UtcNow
+                    },
+                    $"audit:{messageId}",
+                    cts.Token);
+            }
+
+            await inboxStore.MarkCompletedAsync(messageId, CancellationToken.None);
+
+            logger.LogInformation(
+                "Processed message {MessageId} for conversation {ConversationId}: outcome={Outcome}",
+                messageId,
+                conversationId,
+                result.RequiresHandoff ? "handoff" : "processed");
+
+            return IngestMessageResult.Accepted;
         }
-        var previousStage = session.JourneyStage;
-
-        var agentRequest = new AgentRuntimeRequest
+        catch (Exception ex)
         {
-            ConversationId = conversationId,
-            MessageType = message.Type.ToString(),
-            Text = message.Text,
-            JourneyStage = session.JourneyStage,
-            LastIntent = session.LastIntent
-        };
+            logger.LogError(
+                ex,
+                "Message {MessageId} for conversation {ConversationId} failed before Inbox completion",
+                messageId,
+                conversationId);
 
-        var result = await agentRuntimeClient.ProcessAsync(agentRequest, cancellationToken);
-
-        if (result.Intent is not null)
-        {
-            session.LastIntent = result.Intent;
-            session.JourneyStage = ProcessedStage;
-
-            await eventPublisher.PublishIntentDetectedAsync(
-                new IntentDetectedEvent
-                {
-                    ConversationId = conversationId,
-                    Intent = result.Intent,
-                    Confidence = result.Confidence,
-                    DetectedAt = DateTimeOffset.UtcNow
-                },
-                cancellationToken);
+            await MarkFailedBestEffortAsync(messageId, ex.GetType().Name);
+            throw;
         }
+    }
 
-        if (session.JourneyStage != previousStage)
+    private async Task MarkFailedBestEffortAsync(string messageId, string errorType)
+    {
+        try
         {
-            await eventPublisher.PublishConversationStateChangedAsync(
-                new ConversationStateChangedEvent
-                {
-                    ConversationId = conversationId,
-                    PreviousStage = previousStage,
-                    NewStage = session.JourneyStage,
-                    ChangedAt = DateTimeOffset.UtcNow
-                },
-                cancellationToken);
-        }
-
-        using (var cts = new CancellationTokenSource(SideEffectCallTimeout))
-        {
-            await conversationMemoryClient.SaveSessionAsync(session, cts.Token);
-        }
-
-        if (result.RequiresHandoff)
-        {
-            await handoffClient.RequestHandoffAsync(
-                new HandoffRequest
-                {
-                    ConversationId = conversationId,
-                    Reason = result.HandoffReason ?? "unspecified"
-                },
-                cancellationToken);
-        }
-        else if (!string.IsNullOrWhiteSpace(result.ReplyText))
-        {
-            await channelReplyClient.SendReplyAsync(conversationId, result.ReplyText, cancellationToken);
-
             using var cts = new CancellationTokenSource(SideEffectCallTimeout);
-            await conversationMemoryClient.AppendMessageAsync(
-                conversationId, "assistant", result.ReplyText, externalMessageId: null, cts.Token);
+            await inboxStore.MarkFailedAsync(messageId, errorType, cts.Token);
         }
-
-        using (var cts = new CancellationTokenSource(SideEffectCallTimeout))
+        catch (Exception ex)
         {
-            await auditClient.RecordJourneyEventAsync(
-                new JourneyAuditEvent
-                {
-                    ConversationId = conversationId,
-                    Intent = result.Intent,
-                    Outcome = result.RequiresHandoff ? "handoff" : "processed",
-                    Timestamp = DateTimeOffset.UtcNow
-                },
-                cts.Token);
+            logger.LogError(ex, "Failed to mark Inbox message {MessageId} as failed", messageId);
         }
-
-        logger.LogInformation(
-            "Processed message {MessageId} for conversation {ConversationId}: outcome={Outcome}",
-            message.MessageId,
-            conversationId,
-            result.RequiresHandoff ? "handoff" : "processed");
     }
 }
