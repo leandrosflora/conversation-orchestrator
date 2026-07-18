@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Confluent.Kafka;
 using Microsoft.Extensions.Http.Resilience;
 using Microsoft.Extensions.Options;
@@ -12,11 +13,16 @@ using conversation_orchestrator.Application.Ports.Inbound;
 using conversation_orchestrator.Application.Ports.Outbound;
 using conversation_orchestrator.Application.UseCases;
 using conversation_orchestrator.Configuration;
+using conversation_orchestrator.Platform;
+
+Activity.DefaultIdFormat = ActivityIdFormat.W3C;
+Activity.ForceDefaultIdFormat = true;
 
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
+builder.Services.AddPlatformServices(builder.Configuration);
 
 builder.Services.AddOptions<AgentRuntimeOptions>()
     .Bind(builder.Configuration.GetSection(AgentRuntimeOptions.SectionName));
@@ -40,6 +46,7 @@ var otelEndpoint = builder.Configuration.GetSection(OtelOptions.SectionName).Get
 builder.Services.AddOpenTelemetry()
     .ConfigureResource(resource => resource.AddService("conversation-orchestrator"))
     .WithTracing(tracing => tracing
+        .AddSource(KafkaConversationEventPublisher.ActivitySourceName)
         .AddAspNetCoreInstrumentation()
         .AddHttpClientInstrumentation()
         .AddNpgsql()
@@ -64,6 +71,11 @@ builder.Services.AddHttpClient<IAgentRuntimeClient, AgentRuntimeClient>((sp, cli
         var options = sp.GetRequiredService<IOptions<AgentRuntimeOptions>>().Value;
         client.BaseAddress = new Uri(options.BaseUrl);
     })
+    .AddHttpMessageHandler(sp => new InternalRequestHandler(
+        sp.GetRequiredService<InternalTokenService>(),
+        sp.GetRequiredService<IOptions<InternalAuthOptions>>(),
+        sp.GetRequiredService<TenantContext>(),
+        "agent-runtime-renegotiation"))
     .AddStandardResilienceHandler(options =>
     {
         options.Retry.MaxRetryAttempts = 2;
@@ -76,6 +88,11 @@ builder.Services.AddHttpClient<IChannelReplyClient, ChannelReplyClient>((sp, cli
         var options = sp.GetRequiredService<IOptions<ChannelBffOptions>>().Value;
         client.BaseAddress = new Uri(options.BaseUrl);
     })
+    .AddHttpMessageHandler(sp => new InternalRequestHandler(
+        sp.GetRequiredService<InternalTokenService>(),
+        sp.GetRequiredService<IOptions<InternalAuthOptions>>(),
+        sp.GetRequiredService<TenantContext>(),
+        "whatsapp-bff"))
     .AddStandardResilienceHandler(options =>
     {
         options.Retry.MaxRetryAttempts = 2;
@@ -88,6 +105,11 @@ builder.Services.AddHttpClient<IHandoffServiceClient, HandoffServiceClient>((sp,
         var options = sp.GetRequiredService<IOptions<HandoffServiceOptions>>().Value;
         client.BaseAddress = new Uri(options.BaseUrl);
     })
+    .AddHttpMessageHandler(sp => new InternalRequestHandler(
+        sp.GetRequiredService<InternalTokenService>(),
+        sp.GetRequiredService<IOptions<InternalAuthOptions>>(),
+        sp.GetRequiredService<TenantContext>(),
+        "conversation-handoff-service"))
     .AddStandardResilienceHandler(options =>
     {
         options.Retry.MaxRetryAttempts = 2;
@@ -100,6 +122,11 @@ builder.Services.AddHttpClient<IAuditServiceClient, AuditServiceClient>((sp, cli
         var options = sp.GetRequiredService<IOptions<AuditServiceOptions>>().Value;
         client.BaseAddress = new Uri(options.BaseUrl);
     })
+    .AddHttpMessageHandler(sp => new InternalRequestHandler(
+        sp.GetRequiredService<InternalTokenService>(),
+        sp.GetRequiredService<IOptions<InternalAuthOptions>>(),
+        sp.GetRequiredService<TenantContext>(),
+        "conversation-audit-service"))
     .AddStandardResilienceHandler(options =>
     {
         options.Retry.MaxRetryAttempts = 2;
@@ -112,6 +139,11 @@ builder.Services.AddHttpClient<IConversationMemoryClient, ConversationMemoryClie
         var options = sp.GetRequiredService<IOptions<ConversationMemoryOptions>>().Value;
         client.BaseAddress = new Uri(options.BaseUrl);
     })
+    .AddHttpMessageHandler(sp => new InternalRequestHandler(
+        sp.GetRequiredService<InternalTokenService>(),
+        sp.GetRequiredService<IOptions<InternalAuthOptions>>(),
+        sp.GetRequiredService<TenantContext>(),
+        "conversation-memory-service"))
     .AddStandardResilienceHandler(options =>
     {
         options.Retry.MaxRetryAttempts = 2;
@@ -122,7 +154,13 @@ builder.Services.AddHttpClient<IConversationMemoryClient, ConversationMemoryClie
 builder.Services.AddSingleton<IProducer<string, string>>(sp =>
 {
     var options = sp.GetRequiredService<IOptions<KafkaOptions>>().Value;
-    var config = new ProducerConfig { BootstrapServers = options.BootstrapServers };
+    var config = new ProducerConfig
+    {
+        BootstrapServers = options.BootstrapServers,
+        EnableIdempotence = true,
+        Acks = Acks.All,
+        MessageSendMaxRetries = 3
+    };
     return new ProducerBuilder<string, string>(config).Build();
 });
 builder.Services.AddSingleton<IConversationEventPublisher, KafkaConversationEventPublisher>();
@@ -146,6 +184,8 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
+app.UsePlatformServices();
+app.MapPlatformEndpoints();
 app.MapMessageIngestionEndpoints();
 app.Run();
 
