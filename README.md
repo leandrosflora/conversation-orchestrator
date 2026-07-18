@@ -1,49 +1,55 @@
 # Conversation Orchestrator
 
-Orquestrador de conversas para fluxos conversacionais integrados a canais digitais, runtime de agentes, handoff humano, auditoria e eventos Kafka.
+Orquestrador da jornada conversacional de renegociação. Recebe mensagens normalizadas do canal, garante idempotência com Inbox PostgreSQL, carrega sessão e histórico, chama o Agent Runtime, aplica a máquina de estados da jornada, responde pelo canal ou solicita handoff e publica eventos Kafka.
 
-Este serviço recebe mensagens de entrada de canais como WhatsApp BFF, mantém o estado da conversa em memória, chama o Agent Runtime para interpretação da mensagem, decide entre resposta automática ou handoff e publica eventos de jornada.
-
-## Visão geral
+## Fluxo
 
 ```mermaid
 flowchart LR
-    ChannelBff[Channel BFF / WhatsApp BFF] -->|POST /messages| Orchestrator[Conversation Orchestrator]
-    Orchestrator -->|ProcessAsync| AgentRuntime[Agent Runtime]
-    Orchestrator -->|SendReplyAsync| ChannelBff
-    Orchestrator -->|RequestHandoffAsync| Handoff[Handoff Service]
-    Orchestrator -->|RecordJourneyEventAsync| Audit[Audit Service]
-    Orchestrator -->|intent.detected| Kafka[(Kafka)]
-    Orchestrator -->|conversation.state_changed| Kafka
+    BFF[WhatsApp BFF] -->|POST /messages\nJWT + X-Tenant-Id| ORCH[Conversation Orchestrator]
+    ORCH -->|Inbox| PG[(PostgreSQL)]
+    ORCH -->|sessão e histórico| MEM[Conversation Memory Service]
+    ORCH -->|decisão| AGENT[Agent Runtime]
+    ORCH -->|resposta| BFF
+    ORCH -->|handoff idempotente| HANDOFF[Handoff Service]
+    ORCH -->|auditoria idempotente| AUDIT[Audit Service]
+    ORCH -->|intent.detected / state_changed\ntraceparent + tenant| KAFKA[(Kafka)]
 ```
 
-## Stack
+## Garantias implementadas
 
-- .NET 8
-- ASP.NET Core Minimal API
-- Swagger / OpenAPI
-- HttpClient com resilience handler
-- Confluent.Kafka
-- Sessão em memória
+- `POST /messages` exige JWT com audiência `conversation-orchestrator`.
+- `X-Tenant-Id` é obrigatório, validado e propagado para todos os downstreams.
+- O tenant não é mais lido de configuração fixa.
+- Inbox PostgreSQL evita processamento concorrente e permite retomada após falha/lease expirado.
+- Audit e Handoff recebem `Idempotency-Key` estável baseada no `MessageId`.
+- Métodos HTTP inseguros não possuem retry automático.
+- A máquina de estados do domínio continua sendo a única autoridade para mudança de `JourneyStage`.
+- Eventos Kafka carregam `traceparent`, `tracestate` e `tenant-id`.
+- O serviço expõe liveness, readiness e métricas Prometheus.
 
-## Responsabilidades
-
-- Receber mensagens inbound via HTTP.
-- Validar campos obrigatórios da mensagem.
-- Manter sessão conversacional por `ConversationId`.
-- Enviar contexto da conversa para o Agent Runtime.
-- Publicar eventos de intenção e mudança de estado no Kafka.
-- Enviar resposta para o Channel BFF quando houver resposta automática.
-- Solicitar handoff humano quando o Agent Runtime indicar necessidade.
-- Registrar evento de auditoria da jornada.
-
-## Endpoint
+## Endpoint de negócio
 
 ### `POST /messages`
 
-Recebe uma mensagem de canal no contrato canônico `InboundChannelMessage`.
+Headers obrigatórios:
 
-#### Request exemplo
+```http
+Authorization: Bearer <jwt-interno>
+X-Tenant-Id: <tenant>
+Content-Type: application/json
+```
+
+O JWT deve conter:
+
+```text
+iss = conversational-ai-platform
+sub = serviço chamador
+aud = conversation-orchestrator
+exp = curta duração
+```
+
+Exemplo de payload:
 
 ```json
 {
@@ -51,33 +57,87 @@ Recebe uma mensagem de canal no contrato canônico `InboundChannelMessage`.
   "From": "5511999999999",
   "ConversationId": "conv-001",
   "Type": 0,
-  "Text": "Olá, quero consultar meu pedido",
+  "Text": "Quero renegociar minha dívida",
   "Interactive": null,
   "RawPayload": "{}",
-  "ReceivedAt": "2026-07-06T15:00:00Z"
+  "ReceivedAt": "2026-07-18T12:00:00Z"
 }
 ```
 
-#### Respostas
-
-| Status | Descrição |
+| Status | Significado |
 |---|---|
-| `202 Accepted` | Mensagem aceita e processada pelo orquestrador. |
-| `400 Bad Request` | `MessageId`, `From` ou `ConversationId` ausente. |
+| `202` | Processada ou já concluída anteriormente. |
+| `400` | Mensagem ou tenant inválido. |
+| `401` | Token ausente, inválido, expirado ou com audiência incorreta. |
+| `409` | A mesma mensagem ainda está sendo processada por outro lease do Inbox. |
+| `500` | Falha antes da conclusão do Inbox; a linha é marcada como `failed` para retomada. |
 
-## Eventos Kafka
+## Máquina de estados
 
-| Tópico | Quando publica | Chave |
-|---|---|---|
-| `intent.detected` | Quando o Agent Runtime retorna uma intenção. | `ConversationId` |
-| `conversation.state_changed` | Quando o estágio da conversa muda. | `ConversationId` |
+O Agent Runtime interpreta a intenção, mas não escolhe livremente o estágio. O Orchestrator usa:
+
+- `JourneyTriggerClassifier` para converter a intenção em trigger conhecido;
+- `JourneyStageTransitions` para aceitar apenas transições válidas;
+- `JourneyStage.HandoffRequested` quando `RequiresHandoff=true`, independentemente do trigger;
+- persistência do enum como string no Conversation Memory Service.
+
+Triggers ilegais são rejeitados, registrados em log e contabilizados em métricas; o estágio permanece inalterado.
+
+## Autenticação de saída
+
+O Orchestrator emite JWT específico para cada audiência:
+
+| Destino | Audiência |
+|---|---|
+| Agent Runtime | `agent-runtime-renegotiation` |
+| WhatsApp BFF | `whatsapp-bff` |
+| Memory Service | `conversation-memory-service` |
+| Audit Service | `conversation-audit-service` |
+| Handoff Service | `conversation-handoff-service` |
+
+Todas essas chamadas também recebem `X-Tenant-Id`.
+
+## Endpoints operacionais
+
+| Endpoint | Comportamento |
+|---|---|
+| `GET /health/live` | Confirma que o processo está vivo. |
+| `GET /health/ready` | Verifica chave de autenticação, PostgreSQL e Kafka. |
+| `GET /metrics` | Métricas no formato Prometheus. |
+
+Principais grupos de métricas:
+
+- volume e duração HTTP;
+- falhas de autenticação;
+- aquisições e duplicidades do Inbox;
+- chamadas ao Agent Runtime;
+- transições aplicadas e rejeitadas;
+- outcomes de jornada e handoffs;
+- operações do Memory Service;
+- respostas de canal, auditoria e handoff;
+- publicação de eventos Kafka;
+- duração total do processamento.
+
+As labels não usam CPF, texto da mensagem, `ConversationId`, tenant ou intenção livre.
 
 ## Configuração
 
-Configurações principais em `appsettings.json`:
+A chave não deve ser versionada. Configure por variável de ambiente:
+
+```bash
+InternalAuth__SigningKey=<segredo-com-pelo-menos-32-bytes>
+```
+
+Configurações principais:
 
 ```json
 {
+  "InternalAuth": {
+    "Enabled": true,
+    "Issuer": "conversational-ai-platform",
+    "ServiceName": "conversation-orchestrator",
+    "TokenTtlSeconds": 300
+  },
   "AgentRuntime": {
     "BaseUrl": "http://localhost:8100"
   },
@@ -90,107 +150,50 @@ Configurações principais em `appsettings.json`:
   "AuditService": {
     "BaseUrl": "http://localhost:8300"
   },
-  "Kafka": {
-    "BootstrapServers": "localhost:9092",
-    "IntentDetectedTopic": "intent.detected",
-    "ConversationStateChangedTopic": "conversation.state_changed"
-  },
-  "Session": {
-    "TtlMinutes": 30
+  "ConversationMemory": {
+    "BaseUrl": "http://localhost:8600"
   }
 }
 ```
 
-## Como executar localmente
+Para testes locais isolados, a autenticação pode ser explicitamente desabilitada:
 
-### Pré-requisitos
+```bash
+InternalAuth__Enabled=false
+```
 
-- .NET SDK 8+
-- Kafka local em `localhost:9092`
-- Serviços dependentes disponíveis ou mockados:
-  - Agent Runtime: `http://localhost:8100`
-  - Channel BFF: `http://localhost:5153`
-  - Handoff Service: `http://localhost:8200`
-  - Audit Service: `http://localhost:8300`
+O header `X-Tenant-Id` continua obrigatório mesmo nesse modo.
 
-### Restaurar dependências
+## Execução
+
+Pré-requisitos:
+
+- .NET SDK 8;
+- PostgreSQL;
+- Kafka;
+- Agent Runtime, WhatsApp BFF, Memory, Audit e Handoff disponíveis ou mockados.
 
 ```bash
 dotnet restore
-```
-
-### Executar
-
-```bash
+dotnet build
 dotnet run --project conversation-orchestrator.csproj
 ```
 
-Por padrão, o profile HTTP usa:
+Profile HTTP padrão:
 
 ```text
 http://localhost:5268
 ```
 
-Swagger em ambiente de desenvolvimento:
+Swagger em desenvolvimento:
 
 ```text
 http://localhost:5268/swagger
 ```
 
-### Testar endpoint
+## Limitações conhecidas
 
-```bash
-curl -X POST http://localhost:5268/messages \
-  -H "Content-Type: application/json" \
-  -d '{
-    "MessageId": "msg-001",
-    "From": "5511999999999",
-    "ConversationId": "conv-001",
-    "Type": 0,
-    "Text": "Olá",
-    "Interactive": null,
-    "RawPayload": "{}",
-    "ReceivedAt": "2026-07-06T15:00:00Z"
-  }'
-```
-
-## Build
-
-```bash
-dotnet build
-```
-
-## Estrutura esperada
-
-```text
-.
-├── Adapters
-│   ├── Inbound/Http
-│   └── Outbound
-│       ├── Http
-│       ├── Messaging
-│       └── Persistence
-├── Application
-│   ├── Ports
-│   └── UseCases
-├── Configuration
-├── Domain
-├── Program.cs
-├── appsettings.json
-└── conversation-orchestrator.csproj
-```
-
-## Observações técnicas
-
-- O store de sessão atual é em memória. Em produção, deve ser substituído por armazenamento distribuído, como Redis.
-- A publicação Kafka registra erro em log, mas não interrompe o fluxo principal.
-- O contrato `InboundChannelMessage` preserva nomes PascalCase para compatibilidade com o BFF.
-- O projeto ainda não possui suíte de testes versionada.
-
-## Próximos passos sugeridos
-
-- Adicionar testes unitários para `IngestMessageUseCase`.
-- Adicionar testes de contrato para o `POST /messages`.
-- Externalizar sessão para Redis.
-- Adicionar health checks para Kafka e serviços HTTP dependentes.
-- Documentar contratos de entrada e saída em OpenAPI/AsyncAPI.
+- O repositório ainda não possui suíte de testes versionada.
+- Falhas de Audit, Handoff, Memory e envio de resposta continuam degradáveis por adapter e são registradas em métricas/logs.
+- O segredo HS256 compartilhado é adequado para a POC endurecida, mas produção deve usar workload identity, JWT assimétrico com rotação ou mTLS.
+- Métricas estão expostas no mesmo listener da aplicação; em produção devem ficar restritas à rede operacional.

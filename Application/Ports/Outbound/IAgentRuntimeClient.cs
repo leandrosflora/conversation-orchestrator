@@ -8,6 +8,7 @@ public interface IAgentRuntimeClient
 
 public class AgentRuntimeRequest
 {
+    public required string TenantId { get; init; }
     public required string ConversationId { get; init; }
     public required string MessageType { get; init; }
     public string? Text { get; init; }

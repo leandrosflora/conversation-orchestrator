@@ -1,9 +1,13 @@
 using System.Net.Http.Json;
 using conversation_orchestrator.Application.Ports.Outbound;
+using conversation_orchestrator.Platform;
 
 namespace conversation_orchestrator.Adapters.Outbound.Http;
 
-public class AuditServiceClient(HttpClient httpClient, ILogger<AuditServiceClient> logger) : IAuditServiceClient
+public class AuditServiceClient(
+    HttpClient httpClient,
+    PlatformMetrics metrics,
+    ILogger<AuditServiceClient> logger) : IAuditServiceClient
 {
     public async Task RecordJourneyEventAsync(
         JourneyAuditEvent auditEvent,
@@ -19,6 +23,9 @@ public class AuditServiceClient(HttpClient httpClient, ILogger<AuditServiceClien
             httpRequest.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
 
             using var response = await httpClient.SendAsync(httpRequest, cancellationToken);
+            metrics.Increment(
+                "orchestrator_audit_events_total",
+                ("outcome", response.IsSuccessStatusCode ? "success" : "downstream_error"));
 
             if (!response.IsSuccessStatusCode)
             {
@@ -30,8 +37,11 @@ public class AuditServiceClient(HttpClient httpClient, ILogger<AuditServiceClien
         }
         catch (Exception ex)
         {
+            metrics.Increment("orchestrator_audit_events_total", ("outcome", "exception"));
             logger.LogWarning(
-                ex, "Failed to record journey audit event for conversation {ConversationId}", auditEvent.ConversationId);
+                ex,
+                "Failed to record journey audit event for conversation {ConversationId}",
+                auditEvent.ConversationId);
         }
     }
 }

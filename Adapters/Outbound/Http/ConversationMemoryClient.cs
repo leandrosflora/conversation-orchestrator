@@ -1,19 +1,21 @@
 using System.Net.Http.Json;
 using System.Text.Json.Serialization;
-using Microsoft.Extensions.Options;
 using conversation_orchestrator.Application.Ports.Outbound;
-using conversation_orchestrator.Configuration;
 using conversation_orchestrator.Domain;
+using conversation_orchestrator.Platform;
 
 namespace conversation_orchestrator.Adapters.Outbound.Http;
 
 public class ConversationMemoryClient(
     HttpClient httpClient,
-    IOptions<ConversationMemoryOptions> options,
+    TenantContext tenantContext,
     TimeProvider timeProvider,
+    PlatformMetrics metrics,
     ILogger<ConversationMemoryClient> logger) : IConversationMemoryClient
 {
-    public async Task<ConversationSession> GetOrCreateSessionAsync(string conversationId, CancellationToken cancellationToken)
+    public async Task<ConversationSession> GetOrCreateSessionAsync(
+        string conversationId,
+        CancellationToken cancellationToken)
     {
         try
         {
@@ -24,12 +26,17 @@ public class ConversationMemoryClient(
                 var body = await response.Content.ReadFromJsonAsync<SessionResponseDto>(cancellationToken);
                 if (body?.Data is not null)
                 {
-                    // A value that doesn't parse (e.g. persisted under the pre-enum "started"/
-                    // "processed" scheme) falls back to Started rather than failing the request -
-                    // same treatment as a missing session (see journey-state-machine capability).
-                    var journeyStage = Enum.TryParse<JourneyStage>(body.Data.JourneyStage, ignoreCase: true, out var parsed)
+                    var journeyStage = Enum.TryParse<JourneyStage>(
+                        body.Data.JourneyStage,
+                        ignoreCase: true,
+                        out var parsed)
                         ? parsed
                         : JourneyStage.Started;
+
+                    metrics.Increment(
+                        "orchestrator_memory_operations_total",
+                        ("operation", "get_session"),
+                        ("outcome", "success"));
 
                     return new ConversationSession
                     {
@@ -40,26 +47,53 @@ public class ConversationMemoryClient(
                         LastIntent = body.Data.LastIntent
                     };
                 }
+
+                metrics.Increment(
+                    "orchestrator_memory_operations_total",
+                    ("operation", "get_session"),
+                    ("outcome", "empty"));
             }
-            else if (response.StatusCode != System.Net.HttpStatusCode.NotFound)
+            else if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
             {
+                metrics.Increment(
+                    "orchestrator_memory_operations_total",
+                    ("operation", "get_session"),
+                    ("outcome", "not_found"));
+            }
+            else
+            {
+                metrics.Increment(
+                    "orchestrator_memory_operations_total",
+                    ("operation", "get_session"),
+                    ("outcome", "downstream_error"));
                 logger.LogWarning(
-                    "conversation-memory-service responded with non-success status {StatusCode} fetching session for conversation {ConversationId}",
+                    "conversation-memory-service responded with {StatusCode} fetching session for conversation {ConversationId}",
                     response.StatusCode,
                     conversationId);
             }
         }
         catch (Exception ex)
         {
-            logger.LogWarning(
-                ex, "Failed to reach conversation-memory-service fetching session for conversation {ConversationId}", conversationId);
+            metrics.Increment(
+                "orchestrator_memory_operations_total",
+                ("operation", "get_session"),
+                ("outcome", "exception"));
+            logger.LogWarning(ex, "Failed to fetch session for conversation {ConversationId}", conversationId);
         }
 
         var now = timeProvider.GetUtcNow();
-        return new ConversationSession { ConversationId = conversationId, CreatedAt = now, LastMessageAt = now };
+        return new ConversationSession
+        {
+            ConversationId = conversationId,
+            CreatedAt = now,
+            LastMessageAt = now,
+            JourneyStage = JourneyStage.Started
+        };
     }
 
-    public async Task SaveSessionAsync(ConversationSession session, CancellationToken cancellationToken)
+    public async Task SaveSessionAsync(
+        ConversationSession session,
+        CancellationToken cancellationToken)
     {
         try
         {
@@ -73,42 +107,65 @@ public class ConversationMemoryClient(
                 }
             };
 
-            using var response = await httpClient.PutAsJsonAsync($"/sessions/{session.ConversationId}", payload, cancellationToken);
+            using var response = await httpClient.PutAsJsonAsync(
+                $"/sessions/{session.ConversationId}",
+                payload,
+                cancellationToken);
+
+            metrics.Increment(
+                "orchestrator_memory_operations_total",
+                ("operation", "save_session"),
+                ("outcome", response.IsSuccessStatusCode ? "success" : "downstream_error"));
 
             if (!response.IsSuccessStatusCode)
             {
                 logger.LogWarning(
-                    "conversation-memory-service responded with non-success status {StatusCode} saving session for conversation {ConversationId}",
+                    "conversation-memory-service responded with {StatusCode} saving session for conversation {ConversationId}",
                     response.StatusCode,
                     session.ConversationId);
             }
         }
         catch (Exception ex)
         {
-            logger.LogWarning(
-                ex, "Failed to reach conversation-memory-service saving session for conversation {ConversationId}", session.ConversationId);
+            metrics.Increment(
+                "orchestrator_memory_operations_total",
+                ("operation", "save_session"),
+                ("outcome", "exception"));
+            logger.LogWarning(ex, "Failed to save session for conversation {ConversationId}", session.ConversationId);
         }
     }
 
     public async Task AppendMessageAsync(
-        string conversationId, string role, string text, string? externalMessageId, CancellationToken cancellationToken)
+        string conversationId,
+        string role,
+        string text,
+        string? externalMessageId,
+        CancellationToken cancellationToken)
     {
         try
         {
             var payload = new MessageAppendRequestDto
             {
-                TenantId = options.Value.TenantId,
+                TenantId = tenantContext.TenantId,
                 Role = role,
                 Content = new MessageContentDto { Text = text },
                 ExternalMessageId = externalMessageId
             };
 
-            using var response = await httpClient.PostAsJsonAsync($"/conversations/{conversationId}/messages", payload, cancellationToken);
+            using var response = await httpClient.PostAsJsonAsync(
+                $"/conversations/{conversationId}/messages",
+                payload,
+                cancellationToken);
+
+            metrics.Increment(
+                "orchestrator_memory_operations_total",
+                ("operation", "append_message"),
+                ("outcome", response.IsSuccessStatusCode ? "success" : "downstream_error"));
 
             if (!response.IsSuccessStatusCode)
             {
                 logger.LogWarning(
-                    "conversation-memory-service responded with non-success status {StatusCode} appending a {Role} message for conversation {ConversationId}",
+                    "conversation-memory-service responded with {StatusCode} appending a {Role} message for conversation {ConversationId}",
                     response.StatusCode,
                     role,
                     conversationId);
@@ -116,19 +173,18 @@ public class ConversationMemoryClient(
         }
         catch (Exception ex)
         {
+            metrics.Increment(
+                "orchestrator_memory_operations_total",
+                ("operation", "append_message"),
+                ("outcome", "exception"));
             logger.LogWarning(
                 ex,
-                "Failed to reach conversation-memory-service appending a {Role} message for conversation {ConversationId}",
+                "Failed to append a {Role} message for conversation {ConversationId}",
                 role,
                 conversationId);
         }
     }
 
-    // conversation-memory-service's session model has no field aliases (unlike its Mongo-backed
-    // message/memory models), so the wire format is the literal snake_case Pydantic field names -
-    // JsonPropertyName pins that exactly regardless of any global naming policy. The nested "data"
-    // payload is opaque to conversation-memory-service (see its own design), so its inner shape
-    // is entirely up to this client; camelCase here is just this client's own choice.
     private class SessionPutRequestDto
     {
         [JsonPropertyName("data")]
@@ -153,8 +209,6 @@ public class ConversationMemoryClient(
         public string? LastIntent { get; init; }
     }
 
-    // tenantId/externalMessageId have Pydantic aliases with populate_by_name=True (either casing
-    // works), but role/content have no alias at all - those two must be exactly lowercase.
     private class MessageAppendRequestDto
     {
         [JsonPropertyName("tenantId")]

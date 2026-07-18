@@ -1,11 +1,18 @@
 using System.Net.Http.Json;
 using conversation_orchestrator.Application.Ports.Outbound;
+using conversation_orchestrator.Platform;
 
 namespace conversation_orchestrator.Adapters.Outbound.Http;
 
-public class ChannelReplyClient(HttpClient httpClient, ILogger<ChannelReplyClient> logger) : IChannelReplyClient
+public class ChannelReplyClient(
+    HttpClient httpClient,
+    PlatformMetrics metrics,
+    ILogger<ChannelReplyClient> logger) : IChannelReplyClient
 {
-    public async Task SendReplyAsync(string conversationId, string replyText, CancellationToken cancellationToken)
+    public async Task SendReplyAsync(
+        string conversationId,
+        string replyText,
+        CancellationToken cancellationToken)
     {
         try
         {
@@ -13,6 +20,10 @@ public class ChannelReplyClient(HttpClient httpClient, ILogger<ChannelReplyClien
                 "/internal/messages",
                 new { To = conversationId, Type = "text", Text = replyText },
                 cancellationToken);
+
+            metrics.Increment(
+                "orchestrator_channel_replies_total",
+                ("outcome", response.IsSuccessStatusCode ? "success" : "downstream_error"));
 
             if (!response.IsSuccessStatusCode)
             {
@@ -24,8 +35,11 @@ public class ChannelReplyClient(HttpClient httpClient, ILogger<ChannelReplyClien
         }
         catch (Exception ex)
         {
+            metrics.Increment("orchestrator_channel_replies_total", ("outcome", "exception"));
             logger.LogWarning(
-                ex, "Failed to deliver reply via the Channel BFF for conversation {ConversationId}", conversationId);
+                ex,
+                "Failed to deliver reply via the Channel BFF for conversation {ConversationId}",
+                conversationId);
         }
     }
 }
