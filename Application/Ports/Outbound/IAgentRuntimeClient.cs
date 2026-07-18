@@ -2,12 +2,12 @@ namespace conversation_orchestrator.Application.Ports.Outbound;
 
 public interface IAgentRuntimeClient
 {
-    /// <summary>Never throws; returns <see cref="AgentRuntimeResult.Unavailable"/> if the Agent Runtime cannot be reached.</summary>
     Task<AgentRuntimeResult> ProcessAsync(AgentRuntimeRequest request, CancellationToken cancellationToken);
 }
 
 public class AgentRuntimeRequest
 {
+    public required string TenantId { get; init; }
     public required string ConversationId { get; init; }
     public required string MessageType { get; init; }
     public string? Text { get; init; }
@@ -25,7 +25,6 @@ public class AgentRuntimeResult
     public required bool RequiresHandoff { get; init; }
     public string? HandoffReason { get; init; }
 
-    /// <summary>Sentinel result used when the Agent Runtime is unreachable after retries are exhausted.</summary>
     public static AgentRuntimeResult Unavailable() => new()
     {
         Intent = null,
