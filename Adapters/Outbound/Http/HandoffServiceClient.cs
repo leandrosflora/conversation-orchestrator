@@ -5,11 +5,20 @@ namespace conversation_orchestrator.Adapters.Outbound.Http;
 
 public class HandoffServiceClient(HttpClient httpClient, ILogger<HandoffServiceClient> logger) : IHandoffServiceClient
 {
-    public async Task RequestHandoffAsync(HandoffRequest request, CancellationToken cancellationToken)
+    public async Task RequestHandoffAsync(
+        HandoffRequest request,
+        string idempotencyKey,
+        CancellationToken cancellationToken)
     {
         try
         {
-            using var response = await httpClient.PostAsJsonAsync("/handoffs", request, cancellationToken);
+            using var httpRequest = new HttpRequestMessage(HttpMethod.Post, "/handoffs")
+            {
+                Content = JsonContent.Create(request)
+            };
+            httpRequest.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
+
+            using var response = await httpClient.SendAsync(httpRequest, cancellationToken);
 
             if (!response.IsSuccessStatusCode)
             {

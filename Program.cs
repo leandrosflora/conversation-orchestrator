@@ -1,5 +1,7 @@
 using Confluent.Kafka;
+using Microsoft.Extensions.Http.Resilience;
 using Microsoft.Extensions.Options;
+using Npgsql;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using conversation_orchestrator.Adapters.Inbound.Http;
@@ -13,8 +15,6 @@ using conversation_orchestrator.Configuration;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Add services to the container.
-// Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
@@ -32,10 +32,9 @@ builder.Services.AddOptions<KafkaOptions>()
     .Bind(builder.Configuration.GetSection(KafkaOptions.SectionName));
 builder.Services.AddOptions<OtelOptions>()
     .Bind(builder.Configuration.GetSection(OtelOptions.SectionName));
+builder.Services.AddOptions<PostgresOptions>()
+    .Bind(builder.Configuration.GetSection(PostgresOptions.SectionName));
 
-// Exports the ASP.NET Core + outgoing HttpClient Activities that ActivityTrackingOptions
-// below already correlates in logs (TraceId/SpanId/ParentId) to Jaeger via OTLP, so the
-// same trace that ties log lines together also shows up as a real distributed trace.
 var otelEndpoint = builder.Configuration.GetSection(OtelOptions.SectionName).Get<OtelOptions>()?.OtlpEndpoint
     ?? "http://localhost:4317";
 builder.Services.AddOpenTelemetry()
@@ -43,11 +42,22 @@ builder.Services.AddOpenTelemetry()
     .WithTracing(tracing => tracing
         .AddAspNetCoreInstrumentation()
         .AddHttpClientInstrumentation()
+        .AddNpgsql()
         .AddOtlpExporter(otlp => otlp.Endpoint = new Uri(otelEndpoint)));
 
 builder.Services.AddSingleton(TimeProvider.System);
-builder.Services.AddMemoryCache();
-builder.Services.AddSingleton<IMessageDedupeStore, InMemoryMessageDedupeStore>();
+builder.Services.AddSingleton<NpgsqlDataSource>(sp =>
+{
+    var options = sp.GetRequiredService<IOptions<PostgresOptions>>().Value;
+    var connectionString = new NpgsqlConnectionStringBuilder(options.ConnectionString)
+    {
+        Timeout = 5,
+        CommandTimeout = 5
+    };
+
+    return new NpgsqlDataSourceBuilder(connectionString.ConnectionString).Build();
+});
+builder.Services.AddSingleton<IMessageInboxStore, PostgresMessageInboxStore>();
 
 builder.Services.AddHttpClient<IAgentRuntimeClient, AgentRuntimeClient>((sp, client) =>
     {
@@ -58,6 +68,7 @@ builder.Services.AddHttpClient<IAgentRuntimeClient, AgentRuntimeClient>((sp, cli
     {
         options.Retry.MaxRetryAttempts = 2;
         options.Retry.Delay = TimeSpan.FromMilliseconds(200);
+        options.Retry.DisableForUnsafeHttpMethods();
     });
 
 builder.Services.AddHttpClient<IChannelReplyClient, ChannelReplyClient>((sp, client) =>
@@ -69,6 +80,7 @@ builder.Services.AddHttpClient<IChannelReplyClient, ChannelReplyClient>((sp, cli
     {
         options.Retry.MaxRetryAttempts = 2;
         options.Retry.Delay = TimeSpan.FromMilliseconds(200);
+        options.Retry.DisableForUnsafeHttpMethods();
     });
 
 builder.Services.AddHttpClient<IHandoffServiceClient, HandoffServiceClient>((sp, client) =>
@@ -80,6 +92,7 @@ builder.Services.AddHttpClient<IHandoffServiceClient, HandoffServiceClient>((sp,
     {
         options.Retry.MaxRetryAttempts = 2;
         options.Retry.Delay = TimeSpan.FromMilliseconds(200);
+        options.Retry.DisableForUnsafeHttpMethods();
     });
 
 builder.Services.AddHttpClient<IAuditServiceClient, AuditServiceClient>((sp, client) =>
@@ -91,6 +104,7 @@ builder.Services.AddHttpClient<IAuditServiceClient, AuditServiceClient>((sp, cli
     {
         options.Retry.MaxRetryAttempts = 2;
         options.Retry.Delay = TimeSpan.FromMilliseconds(200);
+        options.Retry.DisableForUnsafeHttpMethods();
     });
 
 builder.Services.AddHttpClient<IConversationMemoryClient, ConversationMemoryClient>((sp, client) =>
@@ -102,6 +116,7 @@ builder.Services.AddHttpClient<IConversationMemoryClient, ConversationMemoryClie
     {
         options.Retry.MaxRetryAttempts = 2;
         options.Retry.Delay = TimeSpan.FromMilliseconds(200);
+        options.Retry.DisableForUnsafeHttpMethods();
     });
 
 builder.Services.AddSingleton<IProducer<string, string>>(sp =>
@@ -124,7 +139,6 @@ builder.Logging.AddSimpleConsole(options => options.IncludeScopes = true);
 
 var app = builder.Build();
 
-// Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
@@ -132,9 +146,7 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
-
 app.MapMessageIngestionEndpoints();
-
 app.Run();
 
 public partial class Program;

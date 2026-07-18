@@ -5,11 +5,20 @@ namespace conversation_orchestrator.Adapters.Outbound.Http;
 
 public class AuditServiceClient(HttpClient httpClient, ILogger<AuditServiceClient> logger) : IAuditServiceClient
 {
-    public async Task RecordJourneyEventAsync(JourneyAuditEvent auditEvent, CancellationToken cancellationToken)
+    public async Task RecordJourneyEventAsync(
+        JourneyAuditEvent auditEvent,
+        string idempotencyKey,
+        CancellationToken cancellationToken)
     {
         try
         {
-            using var response = await httpClient.PostAsJsonAsync("/journey-events", auditEvent, cancellationToken);
+            using var httpRequest = new HttpRequestMessage(HttpMethod.Post, "/journey-events")
+            {
+                Content = JsonContent.Create(auditEvent)
+            };
+            httpRequest.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
+
+            using var response = await httpClient.SendAsync(httpRequest, cancellationToken);
 
             if (!response.IsSuccessStatusCode)
             {
