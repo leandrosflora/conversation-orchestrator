@@ -3,7 +3,10 @@ namespace conversation_orchestrator.Application.Ports.Outbound;
 public interface IHandoffServiceClient
 {
     /// <summary>Never throws; logs and returns on failure to reach the Handoff Service.</summary>
-    Task RequestHandoffAsync(HandoffRequest request, CancellationToken cancellationToken);
+    Task RequestHandoffAsync(
+        HandoffRequest request,
+        string idempotencyKey,
+        CancellationToken cancellationToken);
 }
 
 public class HandoffRequest
