@@ -123,7 +123,11 @@ public class IngestMessageUseCase(
                     metrics.Increment(
                         "orchestrator_journey_transitions_total",
                         ("from", session.JourneyStage.ToString()),
-                        ("to", trigger.ToString()),
+                        ("to", session.JourneyStage.ToString()),
+                        ("outcome", "rejected"));
+                    metrics.Increment(
+                        "orchestrator_journey_triggers_total",
+                        ("trigger", trigger.ToString()),
                         ("outcome", "rejected"));
                     logger.LogInformation(
                         "Rejected journey trigger {Trigger} from stage {Stage} for conversation {ConversationId}: not a legal transition",
