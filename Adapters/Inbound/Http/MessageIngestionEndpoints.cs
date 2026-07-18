@@ -28,12 +28,22 @@ public static class MessageIngestionEndpoints
         using var scope = logger.BeginScope(new Dictionary<string, object>
         {
             ["CorrelationId"] = correlationId,
-            ["ConversationId"] = message.ConversationId
+            ["ConversationId"] = message.ConversationId,
+            ["MessageId"] = message.MessageId
         });
 
-        await useCase.ExecuteAsync(message, cancellationToken);
+        var result = await useCase.ExecuteAsync(message, cancellationToken);
 
-        return Results.Accepted();
+        return result switch
+        {
+            IngestMessageResult.Accepted => Results.Accepted(),
+            IngestMessageResult.AlreadyCompleted => Results.Accepted(),
+            IngestMessageResult.InProgress => Results.Conflict(new
+            {
+                error = "Message is already being processed. Retry after the active Inbox lease completes."
+            }),
+            _ => throw new ArgumentOutOfRangeException(nameof(result), result, null)
+        };
     }
 }
 
