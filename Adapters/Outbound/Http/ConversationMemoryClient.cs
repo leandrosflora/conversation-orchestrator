@@ -24,12 +24,19 @@ public class ConversationMemoryClient(
                 var body = await response.Content.ReadFromJsonAsync<SessionResponseDto>(cancellationToken);
                 if (body?.Data is not null)
                 {
+                    // A value that doesn't parse (e.g. persisted under the pre-enum "started"/
+                    // "processed" scheme) falls back to Started rather than failing the request -
+                    // same treatment as a missing session (see journey-state-machine capability).
+                    var journeyStage = Enum.TryParse<JourneyStage>(body.Data.JourneyStage, ignoreCase: true, out var parsed)
+                        ? parsed
+                        : JourneyStage.Started;
+
                     return new ConversationSession
                     {
                         ConversationId = conversationId,
                         CreatedAt = body.Data.CreatedAt,
                         LastMessageAt = timeProvider.GetUtcNow(),
-                        JourneyStage = body.Data.JourneyStage,
+                        JourneyStage = journeyStage,
                         LastIntent = body.Data.LastIntent
                     };
                 }
@@ -61,7 +68,7 @@ public class ConversationMemoryClient(
                 Data = new SessionDataDto
                 {
                     CreatedAt = session.CreatedAt,
-                    JourneyStage = session.JourneyStage,
+                    JourneyStage = session.JourneyStage.ToString(),
                     LastIntent = session.LastIntent
                 }
             };
@@ -140,7 +147,7 @@ public class ConversationMemoryClient(
         public DateTimeOffset CreatedAt { get; init; }
 
         [JsonPropertyName("journeyStage")]
-        public string JourneyStage { get; init; } = "started";
+        public string JourneyStage { get; init; } = "Started";
 
         [JsonPropertyName("lastIntent")]
         public string? LastIntent { get; init; }

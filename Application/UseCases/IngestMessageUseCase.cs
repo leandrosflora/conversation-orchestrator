@@ -14,7 +14,6 @@ public class IngestMessageUseCase(
     IAuditServiceClient auditClient,
     ILogger<IngestMessageUseCase> logger) : IIngestMessageUseCase
 {
-    private const string ProcessedStage = "processed";
     private static readonly TimeSpan SideEffectCallTimeout = TimeSpan.FromSeconds(5);
 
     public async Task<IngestMessageResult> ExecuteAsync(
@@ -63,7 +62,7 @@ public class IngestMessageUseCase(
                 ConversationId = conversationId,
                 MessageType = message.Type.ToString(),
                 Text = message.Text,
-                JourneyStage = session.JourneyStage,
+                JourneyStage = session.JourneyStage.ToString(),
                 LastIntent = session.LastIntent
             };
 
@@ -72,7 +71,6 @@ public class IngestMessageUseCase(
             if (result.Intent is not null)
             {
                 session.LastIntent = result.Intent;
-                session.JourneyStage = ProcessedStage;
 
                 await eventPublisher.PublishIntentDetectedAsync(
                     new IntentDetectedEvent
@@ -85,14 +83,40 @@ public class IngestMessageUseCase(
                     cancellationToken);
             }
 
+            // The Orchestrator, not the Agent Runtime, owns stage transitions: RequiresHandoff
+            // always wins regardless of stage/trigger, and a classified trigger only applies
+            // if the transition table says it's legal from the session's current stage - an
+            // unrecognized or illegal trigger leaves JourneyStage unchanged rather than being
+            // blindly applied (see openspec journey-state-machine capability).
+            if (result.RequiresHandoff)
+            {
+                session.JourneyStage = JourneyStage.HandoffRequested;
+            }
+            else
+            {
+                var trigger = JourneyTriggerClassifier.Classify(result.Intent);
+                if (JourneyStageTransitions.TryGetNext(session.JourneyStage, trigger, out var nextStage))
+                {
+                    session.JourneyStage = nextStage;
+                }
+                else if (trigger != JourneyTrigger.None)
+                {
+                    logger.LogInformation(
+                        "Rejected journey trigger {Trigger} from stage {Stage} for conversation {ConversationId}: not a legal transition",
+                        trigger,
+                        session.JourneyStage,
+                        conversationId);
+                }
+            }
+
             if (session.JourneyStage != previousStage)
             {
                 await eventPublisher.PublishConversationStateChangedAsync(
                     new ConversationStateChangedEvent
                     {
                         ConversationId = conversationId,
-                        PreviousStage = previousStage,
-                        NewStage = session.JourneyStage,
+                        PreviousStage = previousStage.ToString(),
+                        NewStage = session.JourneyStage.ToString(),
                         ChangedAt = DateTimeOffset.UtcNow
                     },
                     cancellationToken);
