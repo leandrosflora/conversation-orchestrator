@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Confluent.Kafka;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.Extensions.Http.Resilience;
 using Microsoft.Extensions.Options;
 using Npgsql;
@@ -23,6 +24,9 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 builder.Services.AddPlatformServices(builder.Configuration);
+builder.Services.PostConfigure<JwtBearerOptions>(
+    JwtBearerDefaults.AuthenticationScheme,
+    options => options.MapInboundClaims = false);
 
 builder.Services.AddOptions<AgentRuntimeOptions>()
     .Bind(builder.Configuration.GetSection(AgentRuntimeOptions.SectionName));
