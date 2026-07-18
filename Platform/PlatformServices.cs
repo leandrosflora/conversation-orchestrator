@@ -321,7 +321,7 @@ public static class PlatformServiceExtensions
         app.MapGet("/health/ready", async (
                 IOptions<InternalAuthOptions> authOptions,
                 NpgsqlDataSource dataSource,
-                IProducer<string, string> producer,
+                IAdminClient adminClient,
                 CancellationToken cancellationToken) =>
             {
                 var failures = new List<string>();
@@ -346,7 +346,7 @@ public static class PlatformServiceExtensions
                 try
                 {
                     await Task.Run(
-                        () => producer.GetMetadata(TimeSpan.FromSeconds(2)),
+                        () => adminClient.GetMetadata(TimeSpan.FromSeconds(2)),
                         cancellationToken);
                 }
                 catch

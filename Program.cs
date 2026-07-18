@@ -179,6 +179,14 @@ builder.Services.AddSingleton<IProducer<string, string>>(sp =>
     };
     return new ProducerBuilder<string, string>(config).Build();
 });
+builder.Services.AddSingleton<IAdminClient>(sp =>
+{
+    var options = sp.GetRequiredService<IOptions<KafkaOptions>>().Value;
+    return new AdminClientBuilder(new AdminClientConfig
+    {
+        BootstrapServers = options.BootstrapServers
+    }).Build();
+});
 builder.Services.AddSingleton<IConversationEventPublisher, KafkaConversationEventPublisher>();
 
 builder.Services.AddScoped<IIngestMessageUseCase, IngestMessageUseCase>();
