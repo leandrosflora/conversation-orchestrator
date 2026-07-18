@@ -292,10 +292,14 @@ public static class PlatformServiceExtensions
 
         services.AddAuthorization(options =>
         {
-            options.DefaultPolicy = new Microsoft.AspNetCore.Authorization.AuthorizationPolicyBuilder()
-                .RequireAuthenticatedUser()
-                .RequireClaim(JwtRegisteredClaimNames.Sub)
-                .Build();
+            options.DefaultPolicy = auth.Enabled
+                ? new Microsoft.AspNetCore.Authorization.AuthorizationPolicyBuilder()
+                    .RequireAuthenticatedUser()
+                    .RequireClaim(JwtRegisteredClaimNames.Sub)
+                    .Build()
+                : new Microsoft.AspNetCore.Authorization.AuthorizationPolicyBuilder()
+                    .RequireAssertion(_ => true)
+                    .Build();
         });
 
         return services;
@@ -350,9 +354,14 @@ public static class PlatformServiceExtensions
                     failures.Add("kafka_unavailable");
                 }
 
-                return failures.Count == 0
-                    ? Results.Ok(new { status = "ready", failures })
-                    : Results.Json(new { status = "not_ready", failures }, statusCode: StatusCodes.Status503ServiceUnavailable);
+                if (failures.Count == 0)
+                {
+                    return Results.Ok(new { status = "ready", failures });
+                }
+
+                return Results.Json(
+                    new { status = "not_ready", failures },
+                    statusCode: StatusCodes.Status503ServiceUnavailable);
             })
             .AllowAnonymous();
 
