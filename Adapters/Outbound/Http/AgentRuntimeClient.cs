@@ -51,6 +51,11 @@ public class AgentRuntimeClient(
                 request.ConversationId);
             return AgentRuntimeResult.Unavailable();
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            outcome = "cancelled";
+            throw;
+        }
         catch (Exception ex)
         {
             logger.LogWarning(
