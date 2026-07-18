@@ -1,4 +1,8 @@
 using System.Diagnostics;
+using System.Globalization;
+using System.Text;
+using System.Text.RegularExpressions;
+using conversation_orchestrator.Application.Outbox;
 using conversation_orchestrator.Application.Ports.Inbound;
 using conversation_orchestrator.Application.Ports.Outbound;
 using conversation_orchestrator.Domain;
@@ -7,19 +11,12 @@ using conversation_orchestrator.Platform;
 namespace conversation_orchestrator.Application.UseCases;
 
 public class IngestMessageUseCase(
-    IConversationMemoryClient conversationMemoryClient,
     IMessageInboxStore inboxStore,
     IAgentRuntimeClient agentRuntimeClient,
-    IChannelReplyClient channelReplyClient,
-    IConversationEventPublisher eventPublisher,
-    IHandoffServiceClient handoffClient,
-    IAuditServiceClient auditClient,
     TenantContext tenantContext,
     PlatformMetrics metrics,
     ILogger<IngestMessageUseCase> logger) : IIngestMessageUseCase
 {
-    private static readonly TimeSpan SideEffectCallTimeout = TimeSpan.FromSeconds(5);
-
     public async Task<IngestMessageResult> ExecuteAsync(
         InboundChannelMessage message,
         CancellationToken cancellationToken)
@@ -27,59 +24,60 @@ public class IngestMessageUseCase(
         var stopwatch = Stopwatch.StartNew();
         var messageId = message.MessageId!;
         var conversationId = message.ConversationId!;
-        var tenantId = tenantContext.TenantId;
+        var tenantId = Guid.Parse(tenantContext.TenantId);
 
-        var acquireResult = await inboxStore.TryAcquireAsync(messageId, conversationId, cancellationToken);
-        if (acquireResult == InboxAcquireResult.Completed)
+        var lease = await inboxStore.TryAcquireAsync(
+            tenantId,
+            messageId,
+            conversationId,
+            message.ReceivedAt,
+            cancellationToken);
+
+        if (lease.Result == InboxAcquireResult.Completed)
         {
             metrics.Increment("orchestrator_inbox_duplicates_total", ("state", "completed"));
-            logger.LogInformation(
-                "Message {MessageId} for conversation {ConversationId} was already completed",
+            return IngestMessageResult.AlreadyCompleted;
+        }
+
+        if (lease.Result == InboxAcquireResult.Late)
+        {
+            metrics.Increment("orchestrator_late_messages_total");
+            logger.LogWarning(
+                "Ignored late message {MessageId} for tenant {TenantId} conversation {ConversationId}",
                 messageId,
+                tenantId,
                 conversationId);
             return IngestMessageResult.AlreadyCompleted;
         }
 
-        if (acquireResult == InboxAcquireResult.InProgress)
+        if (lease.Result == InboxAcquireResult.InProgress || lease.Checkpoint is null)
         {
             metrics.Increment("orchestrator_inbox_duplicates_total", ("state", "processing"));
-            logger.LogInformation(
-                "Message {MessageId} for conversation {ConversationId} is already being processed",
-                messageId,
-                conversationId);
             return IngestMessageResult.InProgress;
         }
 
+        var checkpoint = lease.Checkpoint;
         metrics.Increment("orchestrator_inbox_acquisitions_total", ("outcome", "acquired"));
 
         try
         {
-            using (var cts = new CancellationTokenSource(SideEffectCallTimeout))
-            {
-                await conversationMemoryClient.AppendMessageAsync(
-                    conversationId,
-                    "user",
-                    message.Text ?? string.Empty,
-                    messageId,
-                    cts.Token);
-            }
+            var previousStage = checkpoint.JourneyStage;
+            var confirmationMessageId = ExplicitConfirmationDetector.IsExplicitConfirmation(message, previousStage)
+                ? messageId
+                : null;
 
-            ConversationSession session;
-            using (var cts = new CancellationTokenSource(SideEffectCallTimeout))
-            {
-                session = await conversationMemoryClient.GetOrCreateSessionAsync(conversationId, cts.Token);
-            }
-
-            var previousStage = session.JourneyStage;
             var result = await agentRuntimeClient.ProcessAsync(
                 new AgentRuntimeRequest
                 {
-                    TenantId = tenantId,
+                    TenantId = tenantId.ToString("D"),
                     ConversationId = conversationId,
+                    MessageId = messageId,
                     MessageType = message.Type.ToString(),
-                    Text = message.Text,
-                    JourneyStage = session.JourneyStage.ToString(),
-                    LastIntent = session.LastIntent
+                    Text = message.Text ?? message.Interactive?.Title,
+                    JourneyStage = previousStage.ToString(),
+                    JourneyVersion = checkpoint.Version,
+                    LastIntent = checkpoint.LastIntent,
+                    ExplicitConfirmationMessageId = confirmationMessageId
                 },
                 cancellationToken);
 
@@ -87,31 +85,18 @@ public class IngestMessageUseCase(
                 "orchestrator_agent_decisions_total",
                 ("outcome", ClassifyAgentOutcome(result)));
 
-            if (result.Intent is not null)
-            {
-                session.LastIntent = result.Intent;
-
-                await eventPublisher.PublishIntentDetectedAsync(
-                    new IntentDetectedEvent
-                    {
-                        ConversationId = conversationId,
-                        Intent = result.Intent,
-                        Confidence = result.Confidence,
-                        DetectedAt = DateTimeOffset.UtcNow
-                    },
-                    cancellationToken);
-            }
-
+            var nextIntent = result.Intent ?? checkpoint.LastIntent;
+            var nextStage = previousStage;
             if (result.RequiresHandoff)
             {
-                session.JourneyStage = JourneyStage.HandoffRequested;
+                nextStage = JourneyStage.HandoffRequested;
             }
             else
             {
                 var trigger = JourneyTriggerClassifier.Classify(result.Intent);
-                if (JourneyStageTransitions.TryGetNext(session.JourneyStage, trigger, out var nextStage))
+                if (JourneyStageTransitions.TryGetNext(previousStage, trigger, out var transitionedStage))
                 {
-                    session.JourneyStage = nextStage;
+                    nextStage = transitionedStage;
                     metrics.Increment(
                         "orchestrator_journey_transitions_total",
                         ("from", previousStage.ToString()),
@@ -122,103 +107,55 @@ public class IngestMessageUseCase(
                 {
                     metrics.Increment(
                         "orchestrator_journey_transitions_total",
-                        ("from", session.JourneyStage.ToString()),
-                        ("to", session.JourneyStage.ToString()),
+                        ("from", previousStage.ToString()),
+                        ("to", previousStage.ToString()),
                         ("outcome", "rejected"));
                     metrics.Increment(
                         "orchestrator_journey_triggers_total",
                         ("trigger", trigger.ToString()),
                         ("outcome", "rejected"));
                     logger.LogInformation(
-                        "Rejected journey trigger {Trigger} from stage {Stage} for conversation {ConversationId}: not a legal transition",
+                        "Rejected journey trigger {Trigger} from stage {Stage} for conversation {ConversationId}",
                         trigger,
-                        session.JourneyStage,
+                        previousStage,
                         conversationId);
                 }
             }
 
-            if (session.JourneyStage != previousStage)
-            {
-                if (result.RequiresHandoff)
-                {
-                    metrics.Increment(
-                        "orchestrator_journey_transitions_total",
-                        ("from", previousStage.ToString()),
-                        ("to", session.JourneyStage.ToString()),
-                        ("outcome", "handoff"));
-                }
+            var now = DateTimeOffset.UtcNow;
+            var outcome = result.RequiresHandoff ? "handoff" : "processed";
+            var effects = BuildDurableEffects(
+                tenantId,
+                message,
+                checkpoint,
+                previousStage,
+                nextStage,
+                nextIntent,
+                result,
+                outcome,
+                now);
 
-                await eventPublisher.PublishConversationStateChangedAsync(
-                    new ConversationStateChangedEvent
-                    {
-                        ConversationId = conversationId,
-                        PreviousStage = previousStage.ToString(),
-                        NewStage = session.JourneyStage.ToString(),
-                        ChangedAt = DateTimeOffset.UtcNow
-                    },
-                    cancellationToken);
-            }
-
-            using (var cts = new CancellationTokenSource(SideEffectCallTimeout))
-            {
-                await conversationMemoryClient.SaveSessionAsync(session, cts.Token);
-            }
-
-            var outcome = "processed";
-            if (result.RequiresHandoff)
-            {
-                outcome = "handoff";
-                await handoffClient.RequestHandoffAsync(
-                    new HandoffRequest
-                    {
-                        ConversationId = conversationId,
-                        Reason = result.HandoffReason ?? "unspecified"
-                    },
-                    $"handoff:{messageId}",
-                    cancellationToken);
-
-                metrics.Increment(
-                    "orchestrator_handoffs_total",
-                    ("reason", NormalizeHandoffReason(result.HandoffReason)));
-            }
-            else if (!string.IsNullOrWhiteSpace(result.ReplyText))
-            {
-                await channelReplyClient.SendReplyAsync(conversationId, result.ReplyText, cancellationToken);
-
-                using var cts = new CancellationTokenSource(SideEffectCallTimeout);
-                await conversationMemoryClient.AppendMessageAsync(
+            await inboxStore.CompleteAsync(
+                new CompleteMessageCommand(
+                    tenantId,
+                    messageId,
                     conversationId,
-                    "assistant",
-                    result.ReplyText,
-                    externalMessageId: null,
-                    cts.Token);
-            }
+                    message.ReceivedAt,
+                    nextStage,
+                    nextIntent,
+                    checkpoint.Version,
+                    effects),
+                cancellationToken);
 
-            using (var cts = new CancellationTokenSource(SideEffectCallTimeout))
-            {
-                await auditClient.RecordJourneyEventAsync(
-                    new JourneyAuditEvent
-                    {
-                        ConversationId = conversationId,
-                        Intent = result.Intent,
-                        Outcome = outcome,
-                        Timestamp = DateTimeOffset.UtcNow
-                    },
-                    $"audit:{messageId}",
-                    cts.Token);
-            }
-
-            await inboxStore.MarkCompletedAsync(messageId, CancellationToken.None);
             metrics.Increment("orchestrator_journey_outcomes_total", ("outcome", outcome));
-
+            metrics.Increment("orchestrator_outbox_effects_persisted_total", ("outcome", outcome));
             logger.LogInformation(
-                "Processed message {MessageId} for tenant {TenantId} conversation {ConversationId}: outcome={Outcome} stage={JourneyStage}",
+                "Persisted message {MessageId} tenant {TenantId} conversation {ConversationId} at journey version {JourneyVersion} with {EffectCount} durable effects",
                 messageId,
                 tenantId,
                 conversationId,
-                outcome,
-                session.JourneyStage);
-
+                checkpoint.Version + 1,
+                effects.Count);
             return IngestMessageResult.Accepted;
         }
         catch (Exception ex)
@@ -228,12 +165,11 @@ public class IngestMessageUseCase(
                 ("exception", ex.GetType().Name));
             logger.LogError(
                 ex,
-                "Message {MessageId} for tenant {TenantId} conversation {ConversationId} failed before Inbox completion",
+                "Message {MessageId} tenant {TenantId} conversation {ConversationId} failed before transactional completion",
                 messageId,
                 tenantId,
                 conversationId);
-
-            await MarkFailedBestEffortAsync(messageId, ex.GetType().Name);
+            await MarkFailedBestEffortAsync(tenantId, messageId, ex.GetType().Name);
             throw;
         }
         finally
@@ -245,12 +181,107 @@ public class IngestMessageUseCase(
         }
     }
 
-    private async Task MarkFailedBestEffortAsync(string messageId, string errorType)
+    private static List<DurableEffect> BuildDurableEffects(
+        Guid tenantId,
+        InboundChannelMessage message,
+        ConversationCheckpoint checkpoint,
+        JourneyStage previousStage,
+        JourneyStage nextStage,
+        string? nextIntent,
+        AgentRuntimeResult result,
+        string outcome,
+        DateTimeOffset now)
+    {
+        var messageId = message.MessageId!;
+        var conversationId = message.ConversationId!;
+        var keyPrefix = $"{tenantId:D}:{messageId}";
+        var effects = new List<DurableEffect>
+        {
+            DurableEffectFactory.Create(
+                OutboxEffectTypes.MemoryAppendMessage,
+                $"memory-user:{keyPrefix}",
+                new MemoryAppendMessageEffect(
+                    conversationId,
+                    "user",
+                    message.Text ?? message.Interactive?.Title ?? string.Empty,
+                    messageId)),
+            DurableEffectFactory.Create(
+                OutboxEffectTypes.MemorySaveSession,
+                $"memory-session:{keyPrefix}",
+                new MemorySaveSessionEffect(
+                    conversationId,
+                    checkpoint.LastReceivedAt ?? message.ReceivedAt,
+                    message.ReceivedAt,
+                    nextStage.ToString(),
+                    nextIntent)),
+            DurableEffectFactory.Create(
+                OutboxEffectTypes.AuditRecord,
+                $"audit:{keyPrefix}",
+                new AuditRecordEffect(
+                    conversationId,
+                    result.Intent,
+                    outcome,
+                    now))
+        };
+
+        if (!string.IsNullOrWhiteSpace(result.Intent))
+        {
+            effects.Add(DurableEffectFactory.Create(
+                OutboxEffectTypes.IntentDetected,
+                $"intent:{keyPrefix}",
+                new IntentDetectedEffect(
+                    conversationId,
+                    result.Intent,
+                    result.Confidence,
+                    now)));
+        }
+
+        if (nextStage != previousStage)
+        {
+            effects.Add(DurableEffectFactory.Create(
+                OutboxEffectTypes.StateChanged,
+                $"state:{keyPrefix}",
+                new StateChangedEffect(
+                    conversationId,
+                    previousStage.ToString(),
+                    nextStage.ToString(),
+                    now)));
+        }
+
+        if (result.RequiresHandoff)
+        {
+            effects.Add(DurableEffectFactory.Create(
+                OutboxEffectTypes.HandoffRequest,
+                $"handoff:{keyPrefix}",
+                new HandoffRequestEffect(
+                    conversationId,
+                    result.HandoffReason ?? "unspecified")));
+        }
+        else if (!string.IsNullOrWhiteSpace(result.ReplyText))
+        {
+            effects.Add(DurableEffectFactory.Create(
+                OutboxEffectTypes.ChannelReply,
+                $"reply:{keyPrefix}",
+                new ChannelReplyEffect(conversationId, result.ReplyText)));
+            effects.Add(DurableEffectFactory.Create(
+                OutboxEffectTypes.MemoryAppendMessage,
+                $"memory-assistant:{keyPrefix}",
+                new MemoryAppendMessageEffect(
+                    conversationId,
+                    "assistant",
+                    result.ReplyText,
+                    externalMessageId: null)));
+        }
+
+        return effects;
+    }
+
+    private async Task MarkFailedBestEffortAsync(Guid tenantId, string messageId, string errorType)
     {
         try
         {
-            using var cts = new CancellationTokenSource(SideEffectCallTimeout);
-            await inboxStore.MarkFailedAsync(messageId, errorType, cts.Token);
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            await inboxStore.MarkFailedAsync(tenantId, messageId, errorType, cts.Token);
         }
         catch (Exception ex)
         {
@@ -264,12 +295,48 @@ public class IngestMessageUseCase(
         {
             return "unavailable";
         }
-
         return result.RequiresHandoff ? "handoff" : "automatic";
     }
+}
 
-    private static string NormalizeHandoffReason(string? reason) =>
-        reason == AgentRuntimeResult.AgentRuntimeUnavailableReason
-            ? "agent_runtime_unavailable"
-            : "agent_decision";
+internal static class ExplicitConfirmationDetector
+{
+    private static readonly Regex PositiveConfirmation = new(
+        @"\b(confirmo|aceito|pode confirmar|pode fechar|fechar acordo|quero fechar|sim confirmo|sim aceito)\b",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    public static bool IsExplicitConfirmation(InboundChannelMessage message, JourneyStage stage)
+    {
+        if (stage is not (JourneyStage.ProposalSelected or JourneyStage.ConfirmationPending))
+        {
+            return false;
+        }
+
+        var value = message.Interactive?.Title ?? message.Text;
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var normalized = RemoveDiacritics(value).ToLowerInvariant();
+        if (Regex.IsMatch(normalized, @"\b(nao|nunca|cancel|desist)\b"))
+        {
+            return false;
+        }
+        return PositiveConfirmation.IsMatch(normalized);
+    }
+
+    private static string RemoveDiacritics(string value)
+    {
+        var normalized = value.Normalize(NormalizationForm.FormD);
+        var builder = new StringBuilder(normalized.Length);
+        foreach (var character in normalized)
+        {
+            if (CharUnicodeInfo.GetUnicodeCategory(character) != UnicodeCategory.NonSpacingMark)
+            {
+                builder.Append(character);
+            }
+        }
+        return builder.ToString().Normalize(NormalizationForm.FormC);
+    }
 }
