@@ -103,7 +103,7 @@ public sealed class OutboxDispatcherService(
                     payload.ConversationId,
                     payload.Role,
                     payload.Text,
-                    payload.ExternalMessageId,
+                    payload.ExternalMessageId ?? envelope.IdempotencyKey,
                     cancellationToken);
                 return;
             }
