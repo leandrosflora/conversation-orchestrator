@@ -389,37 +389,55 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
     private static IMessageInboxStore CreateDefaultMessageInboxStore() => new InMemoryMessageInboxStore();
 
     /// <summary>Minimal in-memory stand-in for PostgresMessageInboxStore, tracking real
-    /// per-messageId state so tests like duplicate-message handling behave the same way
-    /// they would against the real store, without needing a live PostgreSQL.</summary>
+    /// per-messageId state and a per-conversation checkpoint so tests like duplicate-message
+    /// handling behave the same way they would against the real store, without needing a live
+    /// PostgreSQL. Matches the outbox-based IMessageInboxStore contract (checkpoint + durable
+    /// effects) introduced alongside OutboxDispatcherService - see conversation-orchestrator's
+    /// Application/UseCases/IngestMessageUseCase.cs for how it's consumed.</summary>
     private sealed class InMemoryMessageInboxStore : IMessageInboxStore
     {
         private readonly HashSet<string> _completed = new();
         private readonly HashSet<string> _inProgress = new();
+        private readonly Dictionary<string, ConversationCheckpoint> _checkpoints = new();
 
-        public Task<InboxAcquireResult> TryAcquireAsync(
-            string messageId, string conversationId, CancellationToken cancellationToken)
+        public Task<InboxLease> TryAcquireAsync(
+            Guid tenantId,
+            string messageId,
+            string conversationId,
+            DateTimeOffset receivedAt,
+            CancellationToken cancellationToken)
         {
             if (_completed.Contains(messageId))
             {
-                return Task.FromResult(InboxAcquireResult.Completed);
+                return Task.FromResult(new InboxLease(InboxAcquireResult.Completed));
             }
 
             if (!_inProgress.Add(messageId))
             {
-                return Task.FromResult(InboxAcquireResult.InProgress);
+                return Task.FromResult(new InboxLease(InboxAcquireResult.InProgress));
             }
 
-            return Task.FromResult(InboxAcquireResult.Acquired);
+            var checkpoint = _checkpoints.TryGetValue(conversationId, out var existing)
+                ? existing
+                : new ConversationCheckpoint(JourneyStage.Started, null, 0, null, null);
+            return Task.FromResult(new InboxLease(InboxAcquireResult.Acquired, checkpoint));
         }
 
-        public Task MarkCompletedAsync(string messageId, CancellationToken cancellationToken)
+        public Task CompleteAsync(CompleteMessageCommand command, CancellationToken cancellationToken)
         {
-            _inProgress.Remove(messageId);
-            _completed.Add(messageId);
+            _inProgress.Remove(command.MessageId);
+            _completed.Add(command.MessageId);
+            _checkpoints[command.ConversationId] = new ConversationCheckpoint(
+                command.JourneyStage,
+                command.LastIntent,
+                command.ExpectedVersion + 1,
+                command.ReceivedAt,
+                command.MessageId);
             return Task.CompletedTask;
         }
 
-        public Task MarkFailedAsync(string messageId, string errorType, CancellationToken cancellationToken)
+        public Task MarkFailedAsync(
+            Guid tenantId, string messageId, string errorType, CancellationToken cancellationToken)
         {
             _inProgress.Remove(messageId);
             return Task.CompletedTask;
