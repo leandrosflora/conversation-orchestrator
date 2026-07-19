@@ -131,6 +131,7 @@ public sealed class OutboxDispatcherService(
                 await services.GetRequiredService<IChannelReplyClient>().SendReplyAsync(
                     payload.ConversationId,
                     payload.ReplyText,
+                    envelope.IdempotencyKey,
                     cancellationToken);
                 return;
             }
