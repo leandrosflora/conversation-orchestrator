@@ -11,12 +11,15 @@ public class ChannelReplyClient(
     public async Task SendReplyAsync(
         string conversationId,
         string replyText,
+        string idempotencyKey,
         CancellationToken cancellationToken)
     {
-        using var response = await httpClient.PostAsJsonAsync(
-            "/internal/messages",
-            new { To = conversationId, Type = "text", Text = replyText },
-            cancellationToken);
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/internal/messages")
+        {
+            Content = JsonContent.Create(new { To = conversationId, Type = "text", Text = replyText })
+        };
+        request.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
+        using var response = await httpClient.SendAsync(request, cancellationToken);
         metrics.Increment(
             "orchestrator_channel_replies_total",
             ("outcome", response.IsSuccessStatusCode ? "success" : "downstream_error"));
