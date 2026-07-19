@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -8,6 +9,7 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 using Moq;
 using conversation_orchestrator.Application.Ports.Outbound;
 using conversation_orchestrator.Domain;
+using conversation_orchestrator.Tests.Testing;
 using Xunit;
 
 namespace conversation_orchestrator.Tests.Messages;
@@ -113,7 +115,7 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
                 It.IsAny<string>(),
                 It.IsAny<CancellationToken>()),
             Times.Once);
-        reply.Verify(r => r.SendReplyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        reply.Verify(r => r.SendReplyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
         audit.Verify(
             a => a.RecordJourneyEventAsync(It.IsAny<JourneyAuditEvent>(), It.IsAny<string>(), It.IsAny<CancellationToken>()),
             Times.Once);
@@ -152,7 +154,7 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
             h => h.RequestHandoffAsync(
                 It.Is<HandoffRequest>(r => r.Reason == "low_confidence"), It.IsAny<string>(), It.IsAny<CancellationToken>()),
             Times.Once);
-        reply.Verify(r => r.SendReplyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        reply.Verify(r => r.SendReplyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
         audit.Verify(
             a => a.RecordJourneyEventAsync(
                 It.Is<JourneyAuditEvent>(e => e.Outcome == "handoff"), It.IsAny<string>(), It.IsAny<CancellationToken>()),
@@ -182,7 +184,7 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
         });
 
         Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
-        reply.Verify(r => r.SendReplyAsync("5511999990000", "Oi!", It.IsAny<CancellationToken>()), Times.Once);
+        reply.Verify(r => r.SendReplyAsync("5511999990000", "Oi!", It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Once);
         audit.Verify(
             a => a.RecordJourneyEventAsync(It.IsAny<JourneyAuditEvent>(), It.IsAny<string>(), It.IsAny<CancellationToken>()),
             Times.Once);
@@ -355,7 +357,7 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
     {
         var factory = _baseFactory.WithWebHostBuilder(builder =>
         {
-            builder.UseSetting("InternalAuth:Enabled", "false");
+            TestAuth.ConfigureSigningKey(builder);
             builder.ConfigureTestServices(services =>
             {
                 services.RemoveAll<IAgentRuntimeClient>();
@@ -382,7 +384,8 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
         });
 
         var client = factory.CreateClient();
-        client.DefaultRequestHeaders.Add("X-Tenant-Id", "00000000-0000-0000-0000-000000000001");
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestAuth.IssueToken());
+        client.DefaultRequestHeaders.Add("X-Tenant-Id", TestAuth.TenantId);
         return client;
     }
 

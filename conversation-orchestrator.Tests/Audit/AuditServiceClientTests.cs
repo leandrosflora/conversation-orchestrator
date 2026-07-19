@@ -31,12 +31,12 @@ public class AuditServiceClientTests
     }
 
     [Fact]
-    public async Task RecordJourneyEventAsync_ServiceUnreachable_DoesNotThrow()
+    public async Task RecordJourneyEventAsync_ServiceUnreachable_PropagatesForOutboxRetry()
     {
         var handler = new StubHttpMessageHandler(_ => throw new HttpRequestException("connection refused"));
         var client = BuildClient(handler);
 
-        var exception = await Record.ExceptionAsync(() => client.RecordJourneyEventAsync(
+        await Assert.ThrowsAsync<HttpRequestException>(() => client.RecordJourneyEventAsync(
             new JourneyAuditEvent
             {
                 ConversationId = "5511999990000",
@@ -45,8 +45,6 @@ public class AuditServiceClientTests
             },
             "audit:test-2",
             CancellationToken.None));
-
-        Assert.Null(exception);
     }
 
     private static IAuditServiceClient BuildClient(StubHttpMessageHandler handler)

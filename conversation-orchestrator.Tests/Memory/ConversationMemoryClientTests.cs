@@ -106,16 +106,14 @@ public class ConversationMemoryClientTests
     }
 
     [Fact]
-    public async Task SaveSessionAsync_ServiceUnreachable_DoesNotThrow()
+    public async Task SaveSessionAsync_ServiceUnreachable_PropagatesForOutboxRetry()
     {
         var handler = new StubHttpMessageHandler(_ => throw new HttpRequestException("connection refused"));
         var client = BuildClient(handler);
 
-        var exception = await Record.ExceptionAsync(() => client.SaveSessionAsync(
+        await Assert.ThrowsAsync<HttpRequestException>(() => client.SaveSessionAsync(
             new ConversationSession { ConversationId = "conv-5", CreatedAt = DateTimeOffset.UtcNow, LastMessageAt = DateTimeOffset.UtcNow },
             CancellationToken.None));
-
-        Assert.Null(exception);
     }
 
     [Fact]
@@ -141,15 +139,13 @@ public class ConversationMemoryClientTests
     }
 
     [Fact]
-    public async Task AppendMessageAsync_ServiceUnreachable_DoesNotThrow()
+    public async Task AppendMessageAsync_ServiceUnreachable_PropagatesForOutboxRetry()
     {
         var handler = new StubHttpMessageHandler(_ => throw new HttpRequestException("connection refused"));
         var client = BuildClient(handler);
 
-        var exception = await Record.ExceptionAsync(() =>
+        await Assert.ThrowsAsync<HttpRequestException>(() =>
             client.AppendMessageAsync("conv-7", "assistant", "Oi!", null, CancellationToken.None));
-
-        Assert.Null(exception);
     }
 
     private static HttpContent JsonContent(string json) =>
@@ -167,7 +163,7 @@ public class ConversationMemoryClientTests
         // flow - fine for a short-lived unit test, and avoids threading a tenant scope
         // through every call site that doesn't otherwise need one.
         var tenantContext = new TenantContext();
-        tenantContext.Push("tenant-test");
+        tenantContext.Push("00000000-0000-0000-0000-000000000001");
         services.AddSingleton(tenantContext);
         services.AddSingleton(new PlatformMetrics());
 

@@ -25,17 +25,15 @@ public class HandoffServiceClientTests
     }
 
     [Fact]
-    public async Task RequestHandoffAsync_ServiceUnreachable_DoesNotThrow()
+    public async Task RequestHandoffAsync_ServiceUnreachable_PropagatesForOutboxRetry()
     {
         var handler = new StubHttpMessageHandler(_ => throw new HttpRequestException("connection refused"));
         var client = BuildClient(handler);
 
-        var exception = await Record.ExceptionAsync(() => client.RequestHandoffAsync(
+        await Assert.ThrowsAsync<HttpRequestException>(() => client.RequestHandoffAsync(
             new HandoffRequest { ConversationId = "5511999990000", Reason = "agent_runtime_unavailable" },
             "handoff:test-2",
             CancellationToken.None));
-
-        Assert.Null(exception);
     }
 
     private static IHandoffServiceClient BuildClient(StubHttpMessageHandler handler)

@@ -1,5 +1,4 @@
 using Confluent.Kafka;
-using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
 using conversation_orchestrator.Adapters.Outbound.Messaging;
@@ -35,8 +34,7 @@ public class KafkaConversationEventPublisherTests
             producer.Object,
             Microsoft.Extensions.Options.Options.Create(Options),
             tenantContext,
-            new PlatformMetrics(),
-            NullLogger<KafkaConversationEventPublisher>.Instance);
+            new PlatformMetrics());
 
         var evt = new IntentDetectedEvent
         {
@@ -57,7 +55,7 @@ public class KafkaConversationEventPublisherTests
     }
 
     [Fact]
-    public async Task PublishConversationStateChangedAsync_BrokerUnavailable_DoesNotThrow()
+    public async Task PublishConversationStateChangedAsync_BrokerUnavailable_PropagatesForOutboxRetry()
     {
         var producer = new Mock<IProducer<string, string>>();
         producer
@@ -72,8 +70,7 @@ public class KafkaConversationEventPublisherTests
             producer.Object,
             Microsoft.Extensions.Options.Options.Create(Options),
             tenantContext,
-            new PlatformMetrics(),
-            NullLogger<KafkaConversationEventPublisher>.Instance);
+            new PlatformMetrics());
 
         var evt = new ConversationStateChangedEvent
         {
@@ -83,9 +80,7 @@ public class KafkaConversationEventPublisherTests
             ChangedAt = DateTimeOffset.UtcNow
         };
 
-        var exception = await Record.ExceptionAsync(() =>
+        await Assert.ThrowsAsync<ProduceException<string, string>>(() =>
             publisher.PublishConversationStateChangedAsync(evt, CancellationToken.None));
-
-        Assert.Null(exception);
     }
 }

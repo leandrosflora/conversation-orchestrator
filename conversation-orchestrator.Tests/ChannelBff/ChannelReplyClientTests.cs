@@ -17,21 +17,19 @@ public class ChannelReplyClientTests
         var handler = new StubHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK));
         var client = BuildClient(handler);
 
-        await client.SendReplyAsync("5511999990000", "Olá!", CancellationToken.None);
+        await client.SendReplyAsync("5511999990000", "Olá!", "idem-key-1", CancellationToken.None);
 
         Assert.Equal(1, handler.CallCount);
     }
 
     [Fact]
-    public async Task SendReplyAsync_ChannelBffUnreachable_DoesNotThrow()
+    public async Task SendReplyAsync_ChannelBffUnreachable_PropagatesForOutboxRetry()
     {
         var handler = new StubHttpMessageHandler(_ => throw new HttpRequestException("connection refused"));
         var client = BuildClient(handler);
 
-        var exception = await Record.ExceptionAsync(() =>
-            client.SendReplyAsync("5511999990000", "Olá!", CancellationToken.None));
-
-        Assert.Null(exception);
+        await Assert.ThrowsAsync<HttpRequestException>(() =>
+            client.SendReplyAsync("5511999990000", "Olá!", "idem-key-2", CancellationToken.None));
     }
 
     private static IChannelReplyClient BuildClient(StubHttpMessageHandler handler)

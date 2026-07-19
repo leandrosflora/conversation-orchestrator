@@ -122,6 +122,7 @@ public class AgentRuntimeClientTests
     {
         TenantId = "00000000-0000-0000-0000-000000000001",
         ConversationId = "5511999990000",
+        MessageId = "wamid.sample",
         MessageType = "Text",
         Text = "Ola",
         JourneyStage = "started"
