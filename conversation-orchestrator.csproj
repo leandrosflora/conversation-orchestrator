@@ -8,6 +8,14 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- conversation-orchestrator.Tests lives inside this project's directory tree - the SDK's
+         default glob would otherwise sweep its .cs files into this project's compile items too. -->
+    <Compile Remove="conversation-orchestrator.Tests\**" />
+    <Content Remove="conversation-orchestrator.Tests\**" />
+    <EmbeddedResource Remove="conversation-orchestrator.Tests\**" />
+    <None Remove="conversation-orchestrator.Tests\**" />
+  </ItemGroup>
+  <ItemGroup>
     <PackageReference Include="Confluent.Kafka" Version="2.15.0" />
     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="8.0.28" />
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="8.0.28" />

@@ -5,7 +5,7 @@ VisualStudioVersion = 17.14.37411.7
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "conversation-orchestrator", "conversation-orchestrator.csproj", "{34EAAF74-7F20-418B-A4C6-BDC246947941}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "conversation-orchestrator.Tests", "..\conversation-orchestrator.Tests\conversation-orchestrator.Tests.csproj", "{4BF8F3BB-722D-486A-A0F8-BEA4426F87A9}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "conversation-orchestrator.Tests", "conversation-orchestrator.Tests\conversation-orchestrator.Tests.csproj", "{4BF8F3BB-722D-486A-A0F8-BEA4426F87A9}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
