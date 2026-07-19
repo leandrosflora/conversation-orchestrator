@@ -162,6 +162,7 @@ public sealed class PostgresMessageInboxStore(
         await EnsureSchemaAsync(cancellationToken);
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        var nextVersion = command.ExpectedVersion + 1;
 
         const string updateStateSql = """
             UPDATE ops.conversation_state
@@ -196,11 +197,11 @@ public sealed class PostgresMessageInboxStore(
 
         const string insertOutboxSql = """
             INSERT INTO ops.orchestrator_outbox
-                (tenant_id, message_id, conversation_id, effect_type, idempotency_key, payload,
-                 status, attempt_count, next_attempt_at, created_at, updated_at)
+                (tenant_id, message_id, conversation_id, journey_version, effect_type,
+                 idempotency_key, payload, status, attempt_count, next_attempt_at, created_at, updated_at)
             VALUES
-                (@tenant_id, @message_id, @conversation_id, @effect_type, @idempotency_key,
-                 @payload::jsonb, 'pending', 0, now(), now(), now())
+                (@tenant_id, @message_id, @conversation_id, @journey_version, @effect_type,
+                 @idempotency_key, @payload::jsonb, 'pending', 0, now(), now(), now())
             ON CONFLICT (tenant_id, idempotency_key) DO NOTHING;
             """;
         foreach (var effect in command.Effects)
@@ -209,6 +210,7 @@ public sealed class PostgresMessageInboxStore(
             insertOutbox.Parameters.AddWithValue("tenant_id", command.TenantId);
             insertOutbox.Parameters.AddWithValue("message_id", command.MessageId);
             insertOutbox.Parameters.AddWithValue("conversation_id", command.ConversationId);
+            insertOutbox.Parameters.AddWithValue("journey_version", nextVersion);
             insertOutbox.Parameters.AddWithValue("effect_type", effect.EffectType);
             insertOutbox.Parameters.AddWithValue("idempotency_key", effect.IdempotencyKey);
             insertOutbox.Parameters.AddWithValue("payload", effect.Payload);
@@ -271,12 +273,20 @@ public sealed class PostgresMessageInboxStore(
         await EnsureSchemaAsync(cancellationToken);
         const string sql = """
             WITH candidates AS (
-                SELECT outbox_id
-                FROM ops.orchestrator_outbox
-                WHERE status IN ('pending', 'failed')
-                  AND next_attempt_at <= now()
-                  AND (locked_until IS NULL OR locked_until < now())
-                ORDER BY created_at
+                SELECT candidate.outbox_id
+                FROM ops.orchestrator_outbox candidate
+                WHERE candidate.status IN ('pending', 'failed')
+                  AND candidate.next_attempt_at <= now()
+                  AND (candidate.locked_until IS NULL OR candidate.locked_until < now())
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM ops.orchestrator_outbox predecessor
+                      WHERE predecessor.tenant_id = candidate.tenant_id
+                        AND predecessor.conversation_id = candidate.conversation_id
+                        AND predecessor.journey_version < candidate.journey_version
+                        AND predecessor.status <> 'published'
+                  )
+                ORDER BY candidate.created_at, candidate.outbox_id
                 FOR UPDATE SKIP LOCKED
                 LIMIT @batch_size
             )
@@ -465,6 +475,7 @@ public sealed class PostgresMessageInboxStore(
                     tenant_id uuid NOT NULL,
                     message_id text NOT NULL,
                     conversation_id text NOT NULL,
+                    journey_version bigint NOT NULL DEFAULT 0,
                     effect_type text NOT NULL,
                     idempotency_key text NOT NULL,
                     payload jsonb NOT NULL,
@@ -478,8 +489,12 @@ public sealed class PostgresMessageInboxStore(
                     published_at timestamptz,
                     UNIQUE (tenant_id, idempotency_key)
                 );
+                ALTER TABLE ops.orchestrator_outbox
+                    ADD COLUMN IF NOT EXISTS journey_version bigint NOT NULL DEFAULT 0;
                 CREATE INDEX IF NOT EXISTS idx_orchestrator_outbox_dispatch
                     ON ops.orchestrator_outbox (status, next_attempt_at, locked_until, created_at);
+                CREATE INDEX IF NOT EXISTS idx_orchestrator_outbox_conversation_version
+                    ON ops.orchestrator_outbox (tenant_id, conversation_id, journey_version, status);
                 """;
             await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
             await using var command = new NpgsqlCommand(sql, connection);
