@@ -270,7 +270,7 @@ public class IngestMessageUseCase(
                     conversationId,
                     "assistant",
                     result.ReplyText,
-                    externalMessageId: null)));
+                    null)));
         }
 
         return effects;
