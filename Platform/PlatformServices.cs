@@ -28,10 +28,8 @@ public sealed class InternalAuthOptions
 
 public sealed class TenantContext
 {
+    public const string ClaimType = "tenant_id";
     private static readonly AsyncLocal<string?> Current = new();
-    private static readonly Regex ValidTenantPattern = new(
-        "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     public string TenantId => Current.Value
         ?? throw new InvalidOperationException("Tenant context is not available.");
@@ -40,7 +38,7 @@ public sealed class TenantContext
     {
         if (!TryNormalize(tenantId, out var normalizedTenantId))
         {
-            throw new ArgumentException("Tenant ID is invalid.", nameof(tenantId));
+            throw new ArgumentException("Tenant ID must be a non-empty UUID.", nameof(tenantId));
         }
 
         var previous = Current.Value;
@@ -50,8 +48,35 @@ public sealed class TenantContext
 
     public static bool TryNormalize(string? tenantId, out string normalizedTenantId)
     {
-        normalizedTenantId = tenantId?.Trim() ?? string.Empty;
-        return ValidTenantPattern.IsMatch(normalizedTenantId);
+        normalizedTenantId = string.Empty;
+        if (!Guid.TryParse(tenantId?.Trim(), out var parsed) || parsed == Guid.Empty)
+        {
+            return false;
+        }
+        normalizedTenantId = parsed.ToString("D");
+        return true;
+    }
+
+    public static bool TryResolveAuthenticatedTenant(
+        ClaimsPrincipal principal,
+        string? headerTenant,
+        out string tenantId)
+    {
+        tenantId = string.Empty;
+        if (!TryNormalize(headerTenant, out var canonicalHeader))
+        {
+            return false;
+        }
+        if (!TryNormalize(principal.FindFirstValue(ClaimType), out var canonicalClaim))
+        {
+            return false;
+        }
+        if (!string.Equals(canonicalHeader, canonicalClaim, StringComparison.Ordinal))
+        {
+            return false;
+        }
+        tenantId = canonicalClaim;
+        return true;
     }
 
     private sealed class Scope(Action dispose) : IDisposable
@@ -64,7 +89,6 @@ public sealed class TenantContext
             {
                 return;
             }
-
             _disposed = true;
             dispose();
         }
@@ -73,23 +97,27 @@ public sealed class TenantContext
 
 public sealed class InternalTokenService(IOptions<InternalAuthOptions> options)
 {
-    public string CreateToken(string audience)
+    public string CreateToken(string audience, string tenantId)
     {
         var value = options.Value;
         if (!value.Enabled)
         {
             throw new InvalidOperationException("Internal authentication is disabled.");
         }
-
         if (!value.HasValidSigningKey)
         {
             throw new InvalidOperationException("InternalAuth:SigningKey must contain at least 32 UTF-8 bytes.");
+        }
+        if (!TenantContext.TryNormalize(tenantId, out var canonicalTenant))
+        {
+            throw new ArgumentException("Tenant ID must be a non-empty UUID.", nameof(tenantId));
         }
 
         var now = DateTime.UtcNow;
         var claims = new[]
         {
             new Claim(JwtRegisteredClaimNames.Sub, value.ServiceName),
+            new Claim(TenantContext.ClaimType, canonicalTenant),
             new Claim(
                 JwtRegisteredClaimNames.Iat,
                 EpochTime.GetIntDate(now).ToString(CultureInfo.InvariantCulture),
@@ -121,14 +149,13 @@ public sealed class InternalRequestHandler(
         HttpRequestMessage request,
         CancellationToken cancellationToken)
     {
+        var tenantId = tenantContext.TenantId;
         if (authOptions.Value.Enabled)
         {
-            request.Headers.Authorization = new("Bearer", tokenService.CreateToken(audience));
+            request.Headers.Authorization = new("Bearer", tokenService.CreateToken(audience, tenantId));
         }
-
         request.Headers.Remove("X-Tenant-Id");
-        request.Headers.TryAddWithoutValidation("X-Tenant-Id", tenantContext.TenantId);
-
+        request.Headers.TryAddWithoutValidation("X-Tenant-Id", tenantId);
         return base.SendAsync(request, cancellationToken);
     }
 }
@@ -152,12 +179,10 @@ public sealed class PlatformMetrics
     public string Render()
     {
         var output = new StringBuilder();
-
         foreach (var item in _counters.OrderBy(item => item.Key, StringComparer.Ordinal))
         {
             output.Append(item.Key).Append(' ').Append(item.Value).AppendLine();
         }
-
         foreach (var item in _durationCounts.OrderBy(item => item.Key, StringComparer.Ordinal))
         {
             _durationSums.TryGetValue(item.Key, out var sum);
@@ -166,7 +191,6 @@ public sealed class PlatformMetrics
             output.Append(ReplaceMetricName(item.Key, "_seconds", "_seconds_sum"))
                 .Append(' ').Append(sum.ToString(CultureInfo.InvariantCulture)).AppendLine();
         }
-
         return output.ToString();
     }
 
@@ -177,10 +201,7 @@ public sealed class PlatformMetrics
         {
             return metricName;
         }
-
-        var renderedLabels = string.Join(
-            ",",
-            labels.Select(label => $"{Sanitize(label.Name)}=\"{Escape(label.Value)}\""));
+        var renderedLabels = string.Join(",", labels.Select(label => $"{Sanitize(label.Name)}=\"{Escape(label.Value)}\""));
         return $"{metricName}{{{renderedLabels}}}";
     }
 
@@ -296,6 +317,7 @@ public static class PlatformServiceExtensions
                 ? new Microsoft.AspNetCore.Authorization.AuthorizationPolicyBuilder()
                     .RequireAuthenticatedUser()
                     .RequireClaim(JwtRegisteredClaimNames.Sub)
+                    .RequireClaim(TenantContext.ClaimType)
                     .Build()
                 : new Microsoft.AspNetCore.Authorization.AuthorizationPolicyBuilder()
                     .RequireAssertion(_ => true)
@@ -345,23 +367,18 @@ public static class PlatformServiceExtensions
 
                 try
                 {
-                    await Task.Run(
-                        () => adminClient.GetMetadata(TimeSpan.FromSeconds(2)),
-                        cancellationToken);
+                    await Task.Run(() => adminClient.GetMetadata(TimeSpan.FromSeconds(2)), cancellationToken);
                 }
                 catch
                 {
                     failures.Add("kafka_unavailable");
                 }
 
-                if (failures.Count == 0)
-                {
-                    return Results.Ok(new { status = "ready", failures });
-                }
-
-                return Results.Json(
-                    new { status = "not_ready", failures },
-                    statusCode: StatusCodes.Status503ServiceUnavailable);
+                return failures.Count == 0
+                    ? Results.Ok(new { status = "ready", failures })
+                    : Results.Json(
+                        new { status = "not_ready", failures },
+                        statusCode: StatusCodes.Status503ServiceUnavailable);
             })
             .AllowAnonymous();
 

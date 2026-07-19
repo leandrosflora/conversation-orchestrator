@@ -15,7 +15,7 @@ public static class MessageIngestionEndpoints
     }
 
     private static async Task<IResult> HandleAsync(
-        HttpRequest request,
+        HttpContext httpContext,
         InboundChannelMessage message,
         IIngestMessageUseCase useCase,
         TenantContext tenantContext,
@@ -25,19 +25,22 @@ public static class MessageIngestionEndpoints
     {
         if (string.IsNullOrWhiteSpace(message.MessageId)
             || string.IsNullOrWhiteSpace(message.From)
-            || string.IsNullOrWhiteSpace(message.ConversationId))
+            || string.IsNullOrWhiteSpace(message.ConversationId)
+            || message.ReceivedAt == default)
         {
             metrics.Increment("orchestrator_messages_rejected_total", ("reason", "invalid_message"));
-            return Results.BadRequest(new { error = "MessageId, From, and ConversationId are required." });
+            return Results.BadRequest(new { error = "MessageId, From, ConversationId, and ReceivedAt are required." });
         }
 
-        if (!TenantContext.TryNormalize(request.Headers["X-Tenant-Id"].ToString(), out var tenantId))
+        if (!TenantContext.TryResolveAuthenticatedTenant(
+                httpContext.User,
+                httpContext.Request.Headers["X-Tenant-Id"].ToString(),
+                out var tenantId))
         {
-            metrics.Increment("orchestrator_messages_rejected_total", ("reason", "invalid_tenant"));
-            return Results.BadRequest(new
-            {
-                error = "X-Tenant-Id is required and must contain only letters, numbers, dot, underscore, colon, or hyphen."
-            });
+            metrics.Increment("orchestrator_messages_rejected_total", ("reason", "tenant_claim_mismatch"));
+            return Results.Json(
+                new { error = "X-Tenant-Id must be a UUID and must match the signed tenant_id claim." },
+                statusCode: StatusCodes.Status403Forbidden);
         }
 
         var correlationId = Activity.Current?.TraceId.ToString() ?? Guid.NewGuid().ToString("n");
@@ -61,7 +64,7 @@ public static class MessageIngestionEndpoints
             IngestMessageResult.AlreadyCompleted => Results.Accepted(),
             IngestMessageResult.InProgress => Results.Conflict(new
             {
-                error = "Message is already being processed. Retry after the active Inbox lease completes."
+                error = "Message or conversation is already being processed. Retry after the active lease completes."
             }),
             _ => throw new ArgumentOutOfRangeException(nameof(result), result, null)
         };

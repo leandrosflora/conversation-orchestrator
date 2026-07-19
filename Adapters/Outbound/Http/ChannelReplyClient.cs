@@ -6,40 +6,23 @@ namespace conversation_orchestrator.Adapters.Outbound.Http;
 
 public class ChannelReplyClient(
     HttpClient httpClient,
-    PlatformMetrics metrics,
-    ILogger<ChannelReplyClient> logger) : IChannelReplyClient
+    PlatformMetrics metrics) : IChannelReplyClient
 {
     public async Task SendReplyAsync(
         string conversationId,
         string replyText,
+        string idempotencyKey,
         CancellationToken cancellationToken)
     {
-        try
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/internal/messages")
         {
-            using var response = await httpClient.PostAsJsonAsync(
-                "/internal/messages",
-                new { To = conversationId, Type = "text", Text = replyText },
-                cancellationToken);
-
-            metrics.Increment(
-                "orchestrator_channel_replies_total",
-                ("outcome", response.IsSuccessStatusCode ? "success" : "downstream_error"));
-
-            if (!response.IsSuccessStatusCode)
-            {
-                logger.LogWarning(
-                    "Channel BFF responded with non-success status {StatusCode} delivering reply for conversation {ConversationId}",
-                    response.StatusCode,
-                    conversationId);
-            }
-        }
-        catch (Exception ex)
-        {
-            metrics.Increment("orchestrator_channel_replies_total", ("outcome", "exception"));
-            logger.LogWarning(
-                ex,
-                "Failed to deliver reply via the Channel BFF for conversation {ConversationId}",
-                conversationId);
-        }
+            Content = JsonContent.Create(new { To = conversationId, Type = "text", Text = replyText })
+        };
+        request.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
+        using var response = await httpClient.SendAsync(request, cancellationToken);
+        metrics.Increment(
+            "orchestrator_channel_replies_total",
+            ("outcome", response.IsSuccessStatusCode ? "success" : "downstream_error"));
+        response.EnsureSuccessStatusCode();
     }
 }

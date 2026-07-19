@@ -65,10 +65,11 @@ builder.Services.AddSingleton<NpgsqlDataSource>(sp =>
         Timeout = 5,
         CommandTimeout = 5
     };
-
     return new NpgsqlDataSourceBuilder(connectionString.ConnectionString).Build();
 });
-builder.Services.AddSingleton<IMessageInboxStore, PostgresMessageInboxStore>();
+builder.Services.AddSingleton<PostgresMessageInboxStore>();
+builder.Services.AddSingleton<IMessageInboxStore>(sp => sp.GetRequiredService<PostgresMessageInboxStore>());
+builder.Services.AddSingleton<IOutboxStore>(sp => sp.GetRequiredService<PostgresMessageInboxStore>());
 
 builder.Services.AddHttpClient<IAgentRuntimeClient, AgentRuntimeClient>((sp, client) =>
     {
@@ -82,17 +83,8 @@ builder.Services.AddHttpClient<IAgentRuntimeClient, AgentRuntimeClient>((sp, cli
         "agent-runtime-renegotiation"))
     .AddStandardResilienceHandler(options =>
     {
-        // Real OpenAI + MCP tool-call round trips observed taking ~21s end to end (see
-        // docs/validation/2026-07-13-e2e-journey.md and the 2026-07-18 quick E2E test) -
-        // comfortably past the framework's 10s/30s defaults. Retries are already disabled
-        // for POST below, so AttemptTimeout is effectively the only budget that matters here;
-        // sized with margin over the worst observed latency instead of retrying a call whose
-        // side effects (LLM invocation, tool execution) aren't safe to repeat.
         options.AttemptTimeout.Timeout = TimeSpan.FromSeconds(45);
         options.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(60);
-        // HttpStandardResilienceOptions requires CircuitBreaker.SamplingDuration >= 2x
-        // AttemptTimeout.Timeout (validated at startup) - bumped along with AttemptTimeout
-        // above to keep that invariant satisfied.
         options.CircuitBreaker.SamplingDuration = TimeSpan.FromSeconds(90);
         options.Retry.MaxRetryAttempts = 2;
         options.Retry.Delay = TimeSpan.FromMilliseconds(200);
@@ -190,6 +182,7 @@ builder.Services.AddSingleton<IAdminClient>(sp =>
 builder.Services.AddSingleton<IConversationEventPublisher, KafkaConversationEventPublisher>();
 
 builder.Services.AddScoped<IIngestMessageUseCase, IngestMessageUseCase>();
+builder.Services.AddHostedService<OutboxDispatcherService>();
 
 builder.Logging.Configure(options =>
 {
