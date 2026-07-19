@@ -5,6 +5,7 @@ public sealed record OutboxEnvelope(
     Guid TenantId,
     string MessageId,
     string ConversationId,
+    long JourneyVersion,
     string EffectType,
     string IdempotencyKey,
     string Payload,
