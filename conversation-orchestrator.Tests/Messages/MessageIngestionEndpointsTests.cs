@@ -1,12 +1,14 @@
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Moq;
+using conversation_orchestrator.Application.Outbox;
 using conversation_orchestrator.Application.Ports.Outbound;
 using conversation_orchestrator.Domain;
 using conversation_orchestrator.Tests.Testing;
@@ -240,7 +242,11 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
             .Setup(c => c.SaveSessionAsync(It.IsAny<ConversationSession>(), It.IsAny<CancellationToken>()))
             .Callback<ConversationSession, CancellationToken>((session, _) => saved = session)
             .Returns(Task.CompletedTask);
-        var client = CreateClient(agentRuntime.Object, conversationMemoryClient: memoryClient.Object);
+        var client = CreateClient(
+            agentRuntime.Object,
+            conversationMemoryClient: memoryClient.Object,
+            seedConversationId: "5511999990000",
+            seedJourneyStage: JourneyStage.CustomerIdentified);
 
         var response = await client.PostAsJsonAsync("/messages", new
         {
@@ -279,7 +285,11 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
             .Setup(c => c.SaveSessionAsync(It.IsAny<ConversationSession>(), It.IsAny<CancellationToken>()))
             .Callback<ConversationSession, CancellationToken>((session, _) => saved = session)
             .Returns(Task.CompletedTask);
-        var client = CreateClient(agentRuntime.Object, conversationMemoryClient: memoryClient.Object);
+        var client = CreateClient(
+            agentRuntime.Object,
+            conversationMemoryClient: memoryClient.Object,
+            seedConversationId: "5511999990000",
+            seedJourneyStage: JourneyStage.CustomerIdentified);
 
         var response = await client.PostAsJsonAsync("/messages", new
         {
@@ -329,7 +339,9 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
             agentRuntime.Object,
             handoffClient: handoff.Object,
             auditClient: audit.Object,
-            conversationMemoryClient: memoryClient.Object);
+            conversationMemoryClient: memoryClient.Object,
+            seedConversationId: "5511999990000",
+            seedJourneyStage: JourneyStage.CustomerIdentified);
 
         var response = await client.PostAsJsonAsync("/messages", new
         {
@@ -353,8 +365,16 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
         IHandoffServiceClient? handoffClient = null,
         IAuditServiceClient? auditClient = null,
         IConversationMemoryClient? conversationMemoryClient = null,
-        IMessageInboxStore? inboxStore = null)
+        IMessageInboxStore? inboxStore = null,
+        string? seedConversationId = null,
+        JourneyStage? seedJourneyStage = null)
     {
+        var reply = replyClient ?? Mock.Of<IChannelReplyClient>();
+        var events = eventPublisher ?? Mock.Of<IConversationEventPublisher>();
+        var handoff = handoffClient ?? Mock.Of<IHandoffServiceClient>();
+        var audit = auditClient ?? Mock.Of<IAuditServiceClient>();
+        var memory = conversationMemoryClient ?? CreateDefaultConversationMemoryClient();
+
         var factory = _baseFactory.WithWebHostBuilder(builder =>
         {
             TestAuth.ConfigureSigningKey(builder);
@@ -364,22 +384,23 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
                 services.AddSingleton(agentRuntimeClient);
 
                 services.RemoveAll<IChannelReplyClient>();
-                services.AddSingleton(replyClient ?? Mock.Of<IChannelReplyClient>());
+                services.AddSingleton(reply);
 
                 services.RemoveAll<IConversationEventPublisher>();
-                services.AddSingleton(eventPublisher ?? Mock.Of<IConversationEventPublisher>());
+                services.AddSingleton(events);
 
                 services.RemoveAll<IHandoffServiceClient>();
-                services.AddSingleton(handoffClient ?? Mock.Of<IHandoffServiceClient>());
+                services.AddSingleton(handoff);
 
                 services.RemoveAll<IAuditServiceClient>();
-                services.AddSingleton(auditClient ?? Mock.Of<IAuditServiceClient>());
+                services.AddSingleton(audit);
 
                 services.RemoveAll<IConversationMemoryClient>();
-                services.AddSingleton(conversationMemoryClient ?? CreateDefaultConversationMemoryClient());
+                services.AddSingleton(memory);
 
                 services.RemoveAll<IMessageInboxStore>();
-                services.AddSingleton(inboxStore ?? CreateDefaultMessageInboxStore());
+                services.AddSingleton(inboxStore ?? new InMemoryMessageInboxStore(
+                    reply, events, handoff, audit, memory, seedConversationId, seedJourneyStage));
             });
         });
 
@@ -389,19 +410,30 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
         return client;
     }
 
-    private static IMessageInboxStore CreateDefaultMessageInboxStore() => new InMemoryMessageInboxStore();
-
-    /// <summary>Minimal in-memory stand-in for PostgresMessageInboxStore, tracking real
-    /// per-messageId state and a per-conversation checkpoint so tests like duplicate-message
-    /// handling behave the same way they would against the real store, without needing a live
-    /// PostgreSQL. Matches the outbox-based IMessageInboxStore contract (checkpoint + durable
-    /// effects) introduced alongside OutboxDispatcherService - see conversation-orchestrator's
+    /// <summary>Minimal in-memory stand-in for PostgresMessageInboxStore + OutboxDispatcherService,
+    /// tracking real per-messageId state and a per-conversation checkpoint so tests like
+    /// duplicate-message handling behave the same way they would against the real store, without
+    /// needing a live PostgreSQL. CompleteAsync also dispatches the durable effects synchronously
+    /// to the same client interfaces OutboxDispatcherService.DispatchPayloadAsync would call
+    /// asynchronously in production, so endpoint tests can assert on them without racing a
+    /// background poller. Matches the outbox-based IMessageInboxStore contract introduced
+    /// alongside OutboxDispatcherService - see conversation-orchestrator's
     /// Application/UseCases/IngestMessageUseCase.cs for how it's consumed.</summary>
-    private sealed class InMemoryMessageInboxStore : IMessageInboxStore
+    private sealed class InMemoryMessageInboxStore(
+        IChannelReplyClient replyClient,
+        IConversationEventPublisher eventPublisher,
+        IHandoffServiceClient handoffClient,
+        IAuditServiceClient auditClient,
+        IConversationMemoryClient memoryClient,
+        string? seedConversationId = null,
+        JourneyStage? seedJourneyStage = null) : IMessageInboxStore
     {
         private readonly HashSet<string> _completed = new();
         private readonly HashSet<string> _inProgress = new();
-        private readonly Dictionary<string, ConversationCheckpoint> _checkpoints = new();
+        private readonly Dictionary<string, ConversationCheckpoint> _checkpoints =
+            seedConversationId is not null && seedJourneyStage is not null
+                ? new() { [seedConversationId] = new ConversationCheckpoint(seedJourneyStage.Value, null, 0, null, null) }
+                : new();
 
         public Task<InboxLease> TryAcquireAsync(
             Guid tenantId,
@@ -426,7 +458,7 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
             return Task.FromResult(new InboxLease(InboxAcquireResult.Acquired, checkpoint));
         }
 
-        public Task CompleteAsync(CompleteMessageCommand command, CancellationToken cancellationToken)
+        public async Task CompleteAsync(CompleteMessageCommand command, CancellationToken cancellationToken)
         {
             _inProgress.Remove(command.MessageId);
             _completed.Add(command.MessageId);
@@ -436,7 +468,11 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
                 command.ExpectedVersion + 1,
                 command.ReceivedAt,
                 command.MessageId);
-            return Task.CompletedTask;
+
+            foreach (var effect in command.Effects)
+            {
+                await DispatchEffectAsync(effect, cancellationToken);
+            }
         }
 
         public Task MarkFailedAsync(
@@ -445,6 +481,105 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
             _inProgress.Remove(messageId);
             return Task.CompletedTask;
         }
+
+        private async Task DispatchEffectAsync(DurableEffect effect, CancellationToken cancellationToken)
+        {
+            switch (effect.EffectType)
+            {
+                case OutboxEffectTypes.MemoryAppendMessage:
+                {
+                    var payload = Deserialize<MemoryAppendMessageEffect>(effect.Payload);
+                    await memoryClient.AppendMessageAsync(
+                        payload.ConversationId,
+                        payload.Role,
+                        payload.Text,
+                        payload.ExternalMessageId ?? effect.IdempotencyKey,
+                        cancellationToken);
+                    return;
+                }
+                case OutboxEffectTypes.MemorySaveSession:
+                {
+                    var payload = Deserialize<MemorySaveSessionEffect>(effect.Payload);
+                    var stage = Enum.TryParse<JourneyStage>(payload.JourneyStage, true, out var parsed)
+                        ? parsed
+                        : JourneyStage.Started;
+                    await memoryClient.SaveSessionAsync(
+                        new ConversationSession
+                        {
+                            ConversationId = payload.ConversationId,
+                            CreatedAt = payload.CreatedAt,
+                            LastMessageAt = payload.LastMessageAt,
+                            JourneyStage = stage,
+                            LastIntent = payload.LastIntent
+                        },
+                        cancellationToken);
+                    return;
+                }
+                case OutboxEffectTypes.ChannelReply:
+                {
+                    var payload = Deserialize<ChannelReplyEffect>(effect.Payload);
+                    await replyClient.SendReplyAsync(
+                        payload.ConversationId, payload.ReplyText, effect.IdempotencyKey, cancellationToken);
+                    return;
+                }
+                case OutboxEffectTypes.HandoffRequest:
+                {
+                    var payload = Deserialize<HandoffRequestEffect>(effect.Payload);
+                    await handoffClient.RequestHandoffAsync(
+                        new HandoffRequest { ConversationId = payload.ConversationId, Reason = payload.Reason },
+                        effect.IdempotencyKey,
+                        cancellationToken);
+                    return;
+                }
+                case OutboxEffectTypes.AuditRecord:
+                {
+                    var payload = Deserialize<AuditRecordEffect>(effect.Payload);
+                    await auditClient.RecordJourneyEventAsync(
+                        new JourneyAuditEvent
+                        {
+                            ConversationId = payload.ConversationId,
+                            Intent = payload.Intent,
+                            Outcome = payload.Outcome,
+                            Timestamp = payload.Timestamp
+                        },
+                        effect.IdempotencyKey,
+                        cancellationToken);
+                    return;
+                }
+                case OutboxEffectTypes.IntentDetected:
+                {
+                    var payload = Deserialize<IntentDetectedEffect>(effect.Payload);
+                    await eventPublisher.PublishIntentDetectedAsync(
+                        new IntentDetectedEvent
+                        {
+                            ConversationId = payload.ConversationId,
+                            Intent = payload.Intent,
+                            Confidence = payload.Confidence,
+                            DetectedAt = payload.DetectedAt
+                        },
+                        cancellationToken);
+                    return;
+                }
+                case OutboxEffectTypes.StateChanged:
+                {
+                    var payload = Deserialize<StateChangedEffect>(effect.Payload);
+                    await eventPublisher.PublishConversationStateChangedAsync(
+                        new ConversationStateChangedEvent
+                        {
+                            ConversationId = payload.ConversationId,
+                            PreviousStage = payload.PreviousStage,
+                            NewStage = payload.NewStage,
+                            ChangedAt = payload.ChangedAt
+                        },
+                        cancellationToken);
+                    return;
+                }
+            }
+        }
+
+        private static T Deserialize<T>(string payload) =>
+            JsonSerializer.Deserialize<T>(payload)
+            ?? throw new InvalidOperationException($"Outbox payload for {typeof(T).Name} is invalid.");
     }
 
     private static IConversationMemoryClient CreateDefaultConversationMemoryClient()

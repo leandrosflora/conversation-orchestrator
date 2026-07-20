@@ -15,6 +15,19 @@ public sealed class OutboxDispatcherService(
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan ClaimLease = TimeSpan.FromSeconds(90);
 
+    // Effects that fail this many times without ever getting a definitive non-retryable signal
+    // are parked too - a transient-looking failure that never resolves in ~a day of exponential
+    // backoff (attempts 1..20 span roughly 24h once the 300s cap kicks in) is de facto permanent
+    // and should stop consuming dispatcher capacity, same as an explicit NonRetryableDispatchException.
+    private const int MaxAttemptsBeforeParking = 20;
+
+    // Chosen to be effectively "never" for next_attempt_at without needing a new outbox status
+    // value (ops.orchestrator_outbox.status has a CHECK constraint the running schema doesn't
+    // migrate) - operators can find parked effects via status='failed' AND next_attempt_at far
+    // in the future, and reconcile/replay them manually per whatsapp-bff's reconciliationRequired
+    // signal.
+    private static readonly TimeSpan ParkedRetryDelay = TimeSpan.FromDays(3650);
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         while (!stoppingToken.IsCancellationRequested)
@@ -67,8 +80,47 @@ public sealed class OutboxDispatcherService(
         {
             throw;
         }
+        catch (NonRetryableDispatchException ex)
+        {
+            await outboxStore.MarkFailedAsync(
+                envelope.OutboxId,
+                ex.GetType().Name,
+                ParkedRetryDelay,
+                CancellationToken.None);
+            metrics.Increment(
+                "orchestrator_outbox_dispatch_total",
+                ("effect", envelope.EffectType),
+                ("outcome", "dead_letter"));
+            logger.LogError(
+                ex,
+                "Parked outbox effect {EffectType} for tenant {TenantId} message {MessageId} as non-retryable; requires manual reconciliation",
+                envelope.EffectType,
+                envelope.TenantId,
+                envelope.MessageId);
+        }
         catch (Exception ex)
         {
+            if (envelope.AttemptCount >= MaxAttemptsBeforeParking)
+            {
+                await outboxStore.MarkFailedAsync(
+                    envelope.OutboxId,
+                    ex.GetType().Name,
+                    ParkedRetryDelay,
+                    CancellationToken.None);
+                metrics.Increment(
+                    "orchestrator_outbox_dispatch_total",
+                    ("effect", envelope.EffectType),
+                    ("outcome", "dead_letter"));
+                logger.LogError(
+                    ex,
+                    "Parked outbox effect {EffectType} for tenant {TenantId} message {MessageId} after {AttemptCount} attempts; requires manual reconciliation",
+                    envelope.EffectType,
+                    envelope.TenantId,
+                    envelope.MessageId,
+                    envelope.AttemptCount);
+                return;
+            }
+
             var retryDelay = TimeSpan.FromSeconds(Math.Min(300, Math.Pow(2, Math.Min(envelope.AttemptCount, 8))));
             await outboxStore.MarkFailedAsync(
                 envelope.OutboxId,
