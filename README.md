@@ -7,14 +7,17 @@ Orquestrador da jornada conversacional de renegociação. Recebe mensagens norma
 ```mermaid
 flowchart LR
     BFF[WhatsApp BFF] -->|POST /messages\nJWT + X-Tenant-Id| ORCH[Conversation Orchestrator]
-    ORCH -->|Inbox| PG[(PostgreSQL)]
-    ORCH -->|sessão e histórico| MEM[Conversation Memory Service]
+    ORCH -->|Inbox + Outbox| PG[(PostgreSQL)]
+    ORCH -.->|dispatch assíncrono| DISP[OutboxDispatcherService]
+    DISP -->|sessão e histórico| MEM[Conversation Memory Service]
     ORCH -->|decisão| AGENT[Agent Runtime]
-    ORCH -->|resposta| BFF
-    ORCH -->|handoff idempotente| HANDOFF[Handoff Service]
-    ORCH -->|auditoria idempotente| AUDIT[Audit Service]
-    ORCH -->|intent.detected / state_changed\ntraceparent + tenant| KAFKA[(Kafka)]
+    DISP -->|resposta| BFF
+    DISP -->|handoff idempotente| HANDOFF[Handoff Service]
+    DISP -->|auditoria idempotente| AUDIT[Audit Service]
+    DISP -->|intent.detected / state_changed\ntraceparent + tenant| KAFKA[(Kafka)]
 ```
+
+`POST /messages` retorna `202` assim que a mensagem e seus efeitos são persistidos de forma transacional no Inbox/Outbox do Postgres — a entrega de fato para BFF, Memory, Audit, Handoff e Kafka acontece **depois**, de forma assíncrona, via `OutboxDispatcherService` (poll a cada 1s). Isso é o que torna a resposta rápida mesmo com o Agent Runtime levando dezenas de segundos.
 
 ## Garantias implementadas
 
@@ -22,6 +25,8 @@ flowchart LR
 - `X-Tenant-Id` é obrigatório, validado e propagado para todos os downstreams.
 - O tenant não é mais lido de configuração fixa.
 - Inbox PostgreSQL evita processamento concorrente e permite retomada após falha/lease expirado.
+- Outbox PostgreSQL garante que os efeitos (reply de canal, memória, auditoria, handoff, eventos Kafka) sejam persistidos na mesma transação que a mensagem, e despachados de forma assíncrona com retry exponencial (2s → 300s).
+- Um efeito de outbox que a própria resposta do downstream sinaliza como definitivamente não-retryable (`retryable: false`, ex.: `whatsapp-bff` recusando reenvio de uma entrega já resolvida) é "estacionado" em vez de retentado para sempre; o mesmo vale para qualquer efeito que falhe 20 vezes seguidas sem esse sinal explícito — nesse ponto ele exige reconciliação manual (métrica `orchestrator_outbox_dispatch_total{outcome="dead_letter"}`).
 - Audit e Handoff recebem `Idempotency-Key` estável baseada no `MessageId`.
 - Métodos HTTP inseguros não possuem retry automático.
 - A máquina de estados do domínio continua sendo a única autoridade para mudança de `JourneyStage`.
@@ -191,9 +196,21 @@ Swagger em desenvolvimento:
 http://localhost:5268/swagger
 ```
 
+## Testes
+
+```bash
+dotnet test
+```
+
+`conversation-orchestrator.Tests` cobre a ingestão de mensagens (incluindo autenticação, duplicidade, transições de jornada), o dispatcher de outbox (retry, parking não-retryable, teto de tentativas) e o client de reply de canal.
+
+## CI
+
+`.github/workflows/ci.yml` roda `dotnet build`/`dotnet test` a cada push/PR para `master`.
+
 ## Limitações conhecidas
 
-- O repositório ainda não possui suíte de testes versionada.
 - Falhas de Audit, Handoff, Memory e envio de resposta continuam degradáveis por adapter e são registradas em métricas/logs.
 - O segredo HS256 compartilhado é adequado para a POC endurecida, mas produção deve usar workload identity, JWT assimétrico com rotação ou mTLS.
 - Métricas estão expostas no mesmo listener da aplicação; em produção devem ficar restritas à rede operacional.
+- Efeitos de outbox "estacionados" (dead-letter) ficam parados no Postgres (`status='failed'`, `next_attempt_at` ~10 anos no futuro) aguardando reconciliação manual por um operador; não há alerta automático além da métrica.
