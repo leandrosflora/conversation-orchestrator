@@ -12,7 +12,9 @@ public sealed class OutboxDispatcherService(
     PlatformMetrics metrics,
     ILogger<OutboxDispatcherService> logger) : BackgroundService
 {
-    private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(1);
+    // Fallback wait when idle: bounds how long a retry whose backoff just elapsed (no fresh signal
+    // fires for those) can sit before the next claim attempt notices it's due.
+    private static readonly TimeSpan IdleWaitTimeout = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan ClaimLease = TimeSpan.FromSeconds(90);
 
     // Effects that fail this many times without ever getting a definitive non-retryable signal
@@ -45,13 +47,13 @@ public sealed class OutboxDispatcherService(
             {
                 logger.LogError(ex, "Failed to claim orchestrator outbox batch");
                 metrics.Increment("orchestrator_outbox_claim_failures_total");
-                await Task.Delay(PollInterval, stoppingToken);
+                await Task.Delay(IdleWaitTimeout, stoppingToken);
                 continue;
             }
 
             if (batch.Count == 0)
             {
-                await Task.Delay(PollInterval, stoppingToken);
+                await outboxStore.WaitForPendingEffectAsync(IdleWaitTimeout, stoppingToken);
                 continue;
             }
 
