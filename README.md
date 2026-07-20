@@ -127,11 +127,28 @@ As labels não usam CPF, texto da mensagem, `ConversationId`, tenant ou intenç�
 
 ## Configuração
 
-A chave não deve ser versionada. Configure por variável de ambiente:
+Cada par (emissor, audiência) de autenticação interna usa seu próprio segredo — não há mais uma
+única chave compartilhada entre serviços. Os segredos não devem ser versionados; configure por
+variável de ambiente (nomes de serviço em upper-snake-case, delimitador `__`):
 
 ```bash
-InternalAuth__SigningKey=<segredo-com-pelo-menos-32-bytes>
+# Emitidos por conversation-orchestrator (InternalAuth:OutboundSecrets:<audiência>)
+INTERNAL_AUTH_SECRET_CONVERSATION_ORCHESTRATOR__WHATSAPP_BFF=<segredo-com-pelo-menos-32-bytes>
+INTERNAL_AUTH_SECRET_CONVERSATION_ORCHESTRATOR__AGENT_RUNTIME_RENEGOTIATION=<segredo-com-pelo-menos-32-bytes>
+INTERNAL_AUTH_SECRET_CONVERSATION_ORCHESTRATOR__CONVERSATION_AUDIT_SERVICE=<segredo-com-pelo-menos-32-bytes>
+INTERNAL_AUTH_SECRET_CONVERSATION_ORCHESTRATOR__CONVERSATION_HANDOFF_SERVICE=<segredo-com-pelo-menos-32-bytes>
+INTERNAL_AUTH_SECRET_CONVERSATION_ORCHESTRATOR__CONVERSATION_MEMORY_SERVICE=<segredo-com-pelo-menos-32-bytes>
+
+# Recebido de whatsapp-bff (InternalAuth:InboundSecrets:whatsapp-bff)
+INTERNAL_AUTH_SECRET_WHATSAPP_BFF__CONVERSATION_ORCHESTRATOR=<mesmo-segredo-configurado-em-whatsapp-bff>
 ```
+
+Cada variável acima é mapeada (via `docker-compose.override.yml`, gerenciado centralmente) para
+`InternalAuth:OutboundSecrets:<audiência>` ou `InternalAuth:InboundSecrets:<emissor>`. O token
+emitido carrega um header `kid` igual ao nome do serviço emissor (`conversation-orchestrator`), e a
+validação de entrada resolve a chave pelo `kid` recebido, restrito à lista de chamadores
+configurados — sem fallback para uma chave padrão. Um `kid` que não bata com o claim `sub` do token
+é rejeitado mesmo com assinatura válida.
 
 Configurações principais:
 
