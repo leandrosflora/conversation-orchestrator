@@ -15,6 +15,11 @@ public sealed class PostgresMessageInboxStore(
     private readonly SemaphoreSlim _schemaLock = new(1, 1);
     private volatile bool _schemaReady;
 
+    // Lets OutboxDispatcherService wake up as soon as CompleteAsync persists new effects instead of
+    // waiting out its idle poll timeout. Capacity 1: bursts of completions before the dispatcher
+    // wakes up coalesce into a single signal - the next ClaimBatchAsync picks up everything anyway.
+    private readonly SemaphoreSlim _dispatchSignal = new(0, 1);
+
     public async Task<InboxLease> TryAcquireAsync(
         Guid tenantId,
         string messageId,
@@ -235,6 +240,11 @@ public sealed class PostgresMessageInboxStore(
         }
 
         await transaction.CommitAsync(cancellationToken);
+
+        if (command.Effects.Count > 0)
+        {
+            SignalPendingEffect();
+        }
     }
 
     public async Task MarkFailedAsync(
@@ -331,6 +341,22 @@ public sealed class PostgresMessageInboxStore(
         await reader.DisposeAsync();
         await transaction.CommitAsync(cancellationToken);
         return results;
+    }
+
+    public Task<bool> WaitForPendingEffectAsync(TimeSpan timeout, CancellationToken cancellationToken) =>
+        _dispatchSignal.WaitAsync(timeout, cancellationToken);
+
+    private void SignalPendingEffect()
+    {
+        try
+        {
+            _dispatchSignal.Release();
+        }
+        catch (SemaphoreFullException)
+        {
+            // A signal is already pending and not yet consumed; the next dispatcher wakeup will
+            // pick up everything ClaimBatchAsync finds, including this effect.
+        }
     }
 
     public async Task MarkPublishedAsync(Guid outboxId, CancellationToken cancellationToken)

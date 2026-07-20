@@ -120,5 +120,11 @@ public class OutboxDispatcherServiceTests
             DrainedOnce.TrySetResult();
             return Task.CompletedTask;
         }
+
+        public async Task<bool> WaitForPendingEffectAsync(TimeSpan timeout, CancellationToken cancellationToken)
+        {
+            await Task.Delay(timeout, cancellationToken);
+            return false;
+        }
     }
 }

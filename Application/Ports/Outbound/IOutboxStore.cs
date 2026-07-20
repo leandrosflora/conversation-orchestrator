@@ -24,4 +24,7 @@ public interface IOutboxStore
         string errorType,
         TimeSpan retryDelay,
         CancellationToken cancellationToken);
+
+    /// <summary>Waits until a new effect is available or the timeout elapses. Returns true if woken by a signal, false on timeout.</summary>
+    Task<bool> WaitForPendingEffectAsync(TimeSpan timeout, CancellationToken cancellationToken);
 }
