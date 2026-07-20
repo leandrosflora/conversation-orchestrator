@@ -10,6 +10,7 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
 using Npgsql;
+using JsonWebToken = Microsoft.IdentityModel.JsonWebTokens.JsonWebToken;
 
 namespace conversation_orchestrator.Platform;
 
@@ -20,10 +21,16 @@ public sealed class InternalAuthOptions
     public bool Enabled { get; init; } = true;
     public string Issuer { get; init; } = "conversational-ai-platform";
     public string ServiceName { get; init; } = "conversation-orchestrator";
-    public string SigningKey { get; init; } = string.Empty;
     public int TokenTtlSeconds { get; init; } = 300;
 
-    public bool HasValidSigningKey => Encoding.UTF8.GetByteCount(SigningKey) >= 32;
+    /// <summary>Audience (callee service name) -> secret used to sign outbound tokens to that audience.</summary>
+    public Dictionary<string, string> OutboundSecrets { get; init; } = new();
+
+    /// <summary>Caller (issuer service name) -> secret used to validate inbound tokens from that caller.</summary>
+    public Dictionary<string, string> InboundSecrets { get; init; } = new();
+
+    public static bool HasValidSecret(string? secret) =>
+        !string.IsNullOrEmpty(secret) && Encoding.UTF8.GetByteCount(secret) >= 32;
 }
 
 public sealed class TenantContext
@@ -104,9 +111,10 @@ public sealed class InternalTokenService(IOptions<InternalAuthOptions> options)
         {
             throw new InvalidOperationException("Internal authentication is disabled.");
         }
-        if (!value.HasValidSigningKey)
+        if (!value.OutboundSecrets.TryGetValue(audience, out var secret) || !InternalAuthOptions.HasValidSecret(secret))
         {
-            throw new InvalidOperationException("InternalAuth:SigningKey must contain at least 32 UTF-8 bytes.");
+            throw new InvalidOperationException(
+                $"InternalAuth:OutboundSecrets:{audience} must be configured with at least 32 UTF-8 bytes.");
         }
         if (!TenantContext.TryNormalize(tenantId, out var canonicalTenant))
         {
@@ -125,15 +133,20 @@ public sealed class InternalTokenService(IOptions<InternalAuthOptions> options)
             new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString("n"))
         };
 
-        var token = new JwtSecurityToken(
+        var signingCredentials = new SigningCredentials(
+            new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secret)),
+            SecurityAlgorithms.HmacSha256);
+
+        var header = new JwtHeader(signingCredentials);
+        header["kid"] = value.ServiceName;
+        var payload = new JwtPayload(
             issuer: value.Issuer,
             audience: audience,
             claims: claims,
             notBefore: now,
             expires: now.AddSeconds(Math.Clamp(value.TokenTtlSeconds, 30, 900)),
-            signingCredentials: new SigningCredentials(
-                new SymmetricSecurityKey(Encoding.UTF8.GetBytes(value.SigningKey)),
-                SecurityAlgorithms.HmacSha256));
+            issuedAt: null);
+        var token = new JwtSecurityToken(header, payload);
 
         return new JwtSecurityTokenHandler().WriteToken(token);
     }
@@ -259,6 +272,23 @@ public sealed class PlatformMetricsMiddleware(RequestDelegate next, PlatformMetr
 
 public static class PlatformServiceExtensions
 {
+    /// <summary>Audiences conversation-orchestrator issues outbound internal-auth tokens for.
+    /// Mirrors the InternalRequestHandler registrations in Program.cs.</summary>
+    private static readonly string[] ExpectedOutboundAudiences =
+    [
+        "whatsapp-bff",
+        "agent-runtime-renegotiation",
+        "conversation-audit-service",
+        "conversation-handoff-service",
+        "conversation-memory-service"
+    ];
+
+    /// <summary>Callers conversation-orchestrator accepts inbound internal-auth tokens from.</summary>
+    private static readonly string[] ExpectedInboundCallers =
+    [
+        "whatsapp-bff"
+    ];
+
     public static IServiceCollection AddPlatformServices(
         this IServiceCollection services,
         IConfiguration configuration)
@@ -270,10 +300,6 @@ public static class PlatformServiceExtensions
         services.AddSingleton<TenantContext>();
         services.AddSingleton<InternalTokenService>();
         services.AddSingleton<PlatformMetrics>();
-
-        var validationKey = auth.HasValidSigningKey
-            ? auth.SigningKey
-            : "invalid-missing-internal-auth-signing-key-32-bytes";
 
         services
             .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
@@ -287,13 +313,42 @@ public static class PlatformServiceExtensions
                     ValidateAudience = true,
                     ValidAudience = auth.ServiceName,
                     ValidateIssuerSigningKey = true,
-                    IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(validationKey)),
+                    IssuerSigningKeyResolver = (token, securityToken, kid, parameters) =>
+                    {
+                        if (kid is null ||
+                            !auth.InboundSecrets.TryGetValue(kid, out var secret) ||
+                            !InternalAuthOptions.HasValidSecret(secret))
+                        {
+                            return Array.Empty<SecurityKey>();
+                        }
+                        return new SecurityKey[] { new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secret)) };
+                    },
                     ValidateLifetime = true,
                     ClockSkew = TimeSpan.FromSeconds(30),
                     NameClaimType = JwtRegisteredClaimNames.Sub
                 };
                 options.Events = new JwtBearerEvents
                 {
+                    OnTokenValidated = context =>
+                    {
+                        var kid = context.SecurityToken switch
+                        {
+                            JwtSecurityToken jwtSecurityToken => jwtSecurityToken.Header?.Kid,
+                            JsonWebToken jsonWebToken => jsonWebToken.Kid,
+                            _ => null
+                        };
+                        var sub = context.Principal?.FindFirstValue(JwtRegisteredClaimNames.Sub);
+
+                        if (kid is null || !string.Equals(kid, sub, StringComparison.Ordinal))
+                        {
+                            context.HttpContext.RequestServices
+                                .GetRequiredService<PlatformMetrics>()
+                                .Increment("platform_internal_auth_failures_total", ("reason", "kid_sub_mismatch"));
+                            context.Fail("Token 'kid' header does not match 'sub' claim.");
+                        }
+
+                        return Task.CompletedTask;
+                    },
                     OnAuthenticationFailed = context =>
                     {
                         context.HttpContext.RequestServices
@@ -349,9 +404,25 @@ public static class PlatformServiceExtensions
                 var failures = new List<string>();
                 var auth = authOptions.Value;
 
-                if (auth.Enabled && !auth.HasValidSigningKey)
+                if (auth.Enabled)
                 {
-                    failures.Add("internal_auth_signing_key_invalid");
+                    foreach (var audience in ExpectedOutboundAudiences)
+                    {
+                        if (!auth.OutboundSecrets.TryGetValue(audience, out var secret) ||
+                            !InternalAuthOptions.HasValidSecret(secret))
+                        {
+                            failures.Add($"internal_auth_outbound_secret_invalid:{audience}");
+                        }
+                    }
+
+                    foreach (var caller in ExpectedInboundCallers)
+                    {
+                        if (!auth.InboundSecrets.TryGetValue(caller, out var secret) ||
+                            !InternalAuthOptions.HasValidSecret(secret))
+                        {
+                            failures.Add($"internal_auth_inbound_secret_invalid:{caller}");
+                        }
+                    }
                 }
 
                 try
