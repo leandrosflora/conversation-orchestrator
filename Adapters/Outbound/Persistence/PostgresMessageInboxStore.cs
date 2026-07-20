@@ -271,6 +271,10 @@ public sealed class PostgresMessageInboxStore(
         CancellationToken cancellationToken)
     {
         await EnsureSchemaAsync(cancellationToken);
+        // A predecessor parked by OutboxDispatcherService (status='failed', next_attempt_at pushed
+        // ~10 years out per ParkedRetryDelay) is terminal, not in-flight - it must not block later
+        // journey_versions of the same conversation forever. Only a predecessor still due for a
+        // real retry soon (or actively pending/publishing) keeps blocking.
         const string sql = """
             WITH candidates AS (
                 SELECT candidate.outbox_id
@@ -285,6 +289,10 @@ public sealed class PostgresMessageInboxStore(
                         AND predecessor.conversation_id = candidate.conversation_id
                         AND predecessor.journey_version < candidate.journey_version
                         AND predecessor.status <> 'published'
+                        AND NOT (
+                            predecessor.status = 'failed'
+                            AND predecessor.next_attempt_at > now() + interval '1 day'
+                        )
                   )
                 ORDER BY candidate.created_at, candidate.outbox_id
                 FOR UPDATE SKIP LOCKED
