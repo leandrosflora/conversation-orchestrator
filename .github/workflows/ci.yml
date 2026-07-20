@@ -15,10 +15,10 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-          # No packages.lock.json in this repo yet, so this cache is a no-op until one exists -
-          # harmless (falls back to no caching) rather than failing the job.
-          cache: true
-          cache-dependency-path: '**/packages.lock.json'
+          # setup-dotnet's cache:true hard-fails ("unable to cache dependencies") when its
+          # cache-dependency-path glob (packages.lock.json by default) matches nothing, rather
+          # than skipping caching - this repo has no lock files, so caching is left off until
+          # one gets added.
 
       - name: Restore
         run: dotnet restore
