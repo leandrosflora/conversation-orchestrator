@@ -257,7 +257,12 @@ public class IngestMessageUseCase(
                     conversationId,
                     result.HandoffReason ?? "unspecified")));
         }
-        else if (!string.IsNullOrWhiteSpace(result.ReplyText))
+
+        // Independent of RequiresHandoff: the agent may hand off *and* still have produced a
+        // reply (e.g. "vou transferir você para um atendente"). Dropping that text left the
+        // customer with total silence on every handoff, even though the agent had something to
+        // say - see docs/validation/2026-07-23-renegotiation-scenario-homologation.md.
+        if (!string.IsNullOrWhiteSpace(result.ReplyText))
         {
             effects.Add(DurableEffectFactory.Create(
                 OutboxEffectTypes.ChannelReply,
