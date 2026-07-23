@@ -15,6 +15,7 @@ public class JourneyStageTransitionsTests
     [InlineData(JourneyStage.SimulationParametersPending, JourneyTrigger.ProposalPresented, JourneyStage.ProposalAvailable)]
     [InlineData(JourneyStage.ProposalAvailable, JourneyTrigger.SelectedProposal, JourneyStage.ProposalSelected)]
     [InlineData(JourneyStage.ProposalSelected, JourneyTrigger.ConfirmedAgreement, JourneyStage.AgreementProcessing)]
+    [InlineData(JourneyStage.HandoffRequested, JourneyTrigger.RequestedRenegotiation, JourneyStage.IdentificationPending)]
     public void TryGetNext_LegalTransition_ReturnsExpectedNextStage(JourneyStage from, JourneyTrigger trigger, JourneyStage expected)
     {
         var result = JourneyStageTransitions.TryGetNext(from, trigger, out var next);
@@ -27,7 +28,7 @@ public class JourneyStageTransitionsTests
     [InlineData(JourneyStage.Started, JourneyTrigger.ConfirmedAgreement)]
     [InlineData(JourneyStage.Started, JourneyTrigger.EligibilityConfirmed)]
     [InlineData(JourneyStage.ProposalAvailable, JourneyTrigger.ProvidedIdentification)]
-    [InlineData(JourneyStage.HandoffRequested, JourneyTrigger.RequestedRenegotiation)]
+    [InlineData(JourneyStage.HandoffRequested, JourneyTrigger.ProvidedIdentification)]
     public void TryGetNext_IllegalTransitionFromCurrentStage_ReturnsFalse(JourneyStage from, JourneyTrigger trigger)
     {
         var result = JourneyStageTransitions.TryGetNext(from, trigger, out _);

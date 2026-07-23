@@ -19,7 +19,17 @@ public static class JourneyStageTransitions
         [(JourneyStage.EligibilityChecked, JourneyTrigger.RequestedSimulation)] = JourneyStage.SimulationParametersPending,
         [(JourneyStage.SimulationParametersPending, JourneyTrigger.ProposalPresented)] = JourneyStage.ProposalAvailable,
         [(JourneyStage.ProposalAvailable, JourneyTrigger.SelectedProposal)] = JourneyStage.ProposalSelected,
-        [(JourneyStage.ProposalSelected, JourneyTrigger.ConfirmedAgreement)] = JourneyStage.AgreementProcessing
+        [(JourneyStage.ProposalSelected, JourneyTrigger.ConfirmedAgreement)] = JourneyStage.AgreementProcessing,
+
+        // Without this, HandoffRequested has no way out: every governed tool at
+        // tool-service-renegotiation denies calls signed with journey_stage=HandoffRequested (see
+        // policy.py's per-tool stage allow-lists, none of which include it), and
+        // conversation-handoff-service has no endpoint to release a conversation back to the bot.
+        // A customer whose conversation was ever handed off - even on a low-confidence false
+        // positive - would otherwise be stuck forever, even if no human ever picks it up. Treat a
+        // fresh renegotiation request the same as a brand-new conversation: let it restart
+        // identification rather than staying silently dead.
+        [(JourneyStage.HandoffRequested, JourneyTrigger.RequestedRenegotiation)] = JourneyStage.IdentificationPending
     };
 
     private static readonly HashSet<JourneyStage> CancellationExcludedStages =
