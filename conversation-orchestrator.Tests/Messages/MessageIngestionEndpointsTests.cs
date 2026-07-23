@@ -164,6 +164,48 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
     }
 
     [Fact]
+    public async Task PostMessages_AgentRuntimeRecommendsHandoffWithReplyText_StillDeliversReply()
+    {
+        var agentRuntime = new Mock<IAgentRuntimeClient>();
+        agentRuntime
+            .Setup(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new AgentRuntimeResult
+            {
+                Intent = "cpf_not_found",
+                ReplyText = "Não localizei seu CPF. Vou te transferir para um atendente.",
+                RequiresHandoff = true,
+                HandoffReason = "cpf_not_found"
+            });
+        var handoff = new Mock<IHandoffServiceClient>();
+        var reply = new Mock<IChannelReplyClient>();
+        var client = CreateClient(
+            agentRuntime.Object, handoffClient: handoff.Object, replyClient: reply.Object);
+
+        var response = await client.PostAsJsonAsync("/messages", new
+        {
+            MessageId = "wamid.6",
+            From = "5511999990000",
+            ConversationId = "5511999990000",
+            Type = 0,
+            Text = "Meu CPF e 00000000000",
+            ReceivedAt = DateTimeOffset.UtcNow
+        });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        handoff.Verify(
+            h => h.RequestHandoffAsync(
+                It.Is<HandoffRequest>(r => r.Reason == "cpf_not_found"), It.IsAny<string>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+        reply.Verify(
+            r => r.SendReplyAsync(
+                "5511999990000",
+                "Não localizei seu CPF. Vou te transferir para um atendente.",
+                It.IsAny<string>(),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
     public async Task PostMessages_ReplyDelivered_AuditRecordedRegardlessOfOutcome()
     {
         var agentRuntime = new Mock<IAgentRuntimeClient>();
