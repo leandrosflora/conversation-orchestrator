@@ -34,6 +34,7 @@ public class AgentRuntimeResult
     public string? ActiveContractId { get; init; }
     public string? ActiveSimulationId { get; init; }
     public string? ActiveAgreementId { get; init; }
+    public string? JourneyMilestone { get; init; }
 
     public static AgentRuntimeResult Unavailable() => new()
     {
