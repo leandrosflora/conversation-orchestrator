@@ -16,6 +16,9 @@ public class AgentRuntimeRequest
     public string? JourneyStage { get; init; }
     public long JourneyVersion { get; init; }
     public string? LastIntent { get; init; }
+    public string? ActiveContractId { get; init; }
+    public string? ActiveSimulationId { get; init; }
+    public string? ActiveAgreementId { get; init; }
     public string? ExplicitConfirmationMessageId { get; init; }
 }
 
@@ -28,6 +31,9 @@ public class AgentRuntimeResult
     public string? ReplyText { get; init; }
     public required bool RequiresHandoff { get; init; }
     public string? HandoffReason { get; init; }
+    public string? ActiveContractId { get; init; }
+    public string? ActiveSimulationId { get; init; }
+    public string? ActiveAgreementId { get; init; }
 
     public static AgentRuntimeResult Unavailable() => new()
     {
