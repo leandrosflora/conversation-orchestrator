@@ -510,6 +510,254 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
         Assert.Equal(JourneyStage.HandoffRequested, saved!.JourneyStage);
     }
 
+    [Fact]
+    public async Task PostMessages_JourneyMilestone_AdvancesDirectlyIgnoringUnrecognizedIntent()
+    {
+        // JourneyMilestone comes from verified tool outcomes (agent-runtime-renegotiation), not
+        // freeform Intent text - it should drive the stage even when Intent classifies to nothing.
+        var agentRuntime = new Mock<IAgentRuntimeClient>();
+        agentRuntime
+            .Setup(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new AgentRuntimeResult
+            {
+                Intent = "consultar_debitos",
+                ReplyText = "Identifiquei seus dois contratos.",
+                RequiresHandoff = false,
+                JourneyMilestone = "ContractSelectionPending"
+            });
+        ConversationSession? saved = null;
+        var memoryClient = new Mock<IConversationMemoryClient>();
+        memoryClient
+            .Setup(c => c.GetOrCreateSessionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string conversationId, CancellationToken _) => new ConversationSession
+            {
+                ConversationId = conversationId,
+                CreatedAt = DateTimeOffset.UtcNow,
+                LastMessageAt = DateTimeOffset.UtcNow,
+                JourneyStage = JourneyStage.IdentificationPending
+            });
+        memoryClient
+            .Setup(c => c.SaveSessionAsync(It.IsAny<ConversationSession>(), It.IsAny<CancellationToken>()))
+            .Callback<ConversationSession, CancellationToken>((session, _) => saved = session)
+            .Returns(Task.CompletedTask);
+        var client = CreateClient(
+            agentRuntime.Object,
+            conversationMemoryClient: memoryClient.Object,
+            seedConversationId: "5511999990000",
+            seedJourneyStage: JourneyStage.IdentificationPending);
+
+        var response = await client.PostAsJsonAsync("/messages", new
+        {
+            MessageId = "wamid.milestone-1",
+            From = "5511999990000",
+            ConversationId = "5511999990000",
+            Type = 0,
+            Text = "Meu CPF e 22222222222",
+            ReceivedAt = DateTimeOffset.UtcNow
+        });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        Assert.NotNull(saved);
+        Assert.Equal(JourneyStage.ContractSelectionPending, saved!.JourneyStage);
+    }
+
+    [Fact]
+    public async Task PostMessages_JourneyMilestone_RegressiveMilestoneFallsBackToIntentClassification()
+    {
+        var agentRuntime = new Mock<IAgentRuntimeClient>();
+        agentRuntime
+            .Setup(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new AgentRuntimeResult
+            {
+                Intent = "aceito essa proposta",
+                ReplyText = "Combinado!",
+                RequiresHandoff = false,
+                JourneyMilestone = "CustomerIdentified"
+            });
+        ConversationSession? saved = null;
+        var memoryClient = new Mock<IConversationMemoryClient>();
+        memoryClient
+            .Setup(c => c.GetOrCreateSessionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string conversationId, CancellationToken _) => new ConversationSession
+            {
+                ConversationId = conversationId,
+                CreatedAt = DateTimeOffset.UtcNow,
+                LastMessageAt = DateTimeOffset.UtcNow,
+                JourneyStage = JourneyStage.ProposalAvailable
+            });
+        memoryClient
+            .Setup(c => c.SaveSessionAsync(It.IsAny<ConversationSession>(), It.IsAny<CancellationToken>()))
+            .Callback<ConversationSession, CancellationToken>((session, _) => saved = session)
+            .Returns(Task.CompletedTask);
+        var client = CreateClient(
+            agentRuntime.Object,
+            conversationMemoryClient: memoryClient.Object,
+            seedConversationId: "5511999990000",
+            seedJourneyStage: JourneyStage.ProposalAvailable);
+
+        var response = await client.PostAsJsonAsync("/messages", new
+        {
+            MessageId = "wamid.milestone-2",
+            From = "5511999990000",
+            ConversationId = "5511999990000",
+            Type = 0,
+            Text = "Aceito essa proposta",
+            ReceivedAt = DateTimeOffset.UtcNow
+        });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        Assert.NotNull(saved);
+        // The stale/regressive milestone (CustomerIdentified) is ignored; the legal
+        // ProposalAvailable -> ProposalSelected transition from Intent classification wins instead.
+        Assert.Equal(JourneyStage.ProposalSelected, saved!.JourneyStage);
+    }
+
+    [Fact]
+    public async Task PostMessages_JourneyMilestone_HandoffOverridesAnOtherwiseLegalMilestone()
+    {
+        var agentRuntime = new Mock<IAgentRuntimeClient>();
+        agentRuntime
+            .Setup(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new AgentRuntimeResult
+            {
+                Intent = "consultar_cliente",
+                RequiresHandoff = true,
+                HandoffReason = "low_confidence",
+                JourneyMilestone = "ContractSelected"
+            });
+        ConversationSession? saved = null;
+        var memoryClient = new Mock<IConversationMemoryClient>();
+        memoryClient
+            .Setup(c => c.GetOrCreateSessionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string conversationId, CancellationToken _) => new ConversationSession
+            {
+                ConversationId = conversationId,
+                CreatedAt = DateTimeOffset.UtcNow,
+                LastMessageAt = DateTimeOffset.UtcNow,
+                JourneyStage = JourneyStage.IdentificationPending
+            });
+        memoryClient
+            .Setup(c => c.SaveSessionAsync(It.IsAny<ConversationSession>(), It.IsAny<CancellationToken>()))
+            .Callback<ConversationSession, CancellationToken>((session, _) => saved = session)
+            .Returns(Task.CompletedTask);
+        var client = CreateClient(
+            agentRuntime.Object,
+            conversationMemoryClient: memoryClient.Object,
+            seedConversationId: "5511999990000",
+            seedJourneyStage: JourneyStage.IdentificationPending);
+
+        var response = await client.PostAsJsonAsync("/messages", new
+        {
+            MessageId = "wamid.milestone-3",
+            From = "5511999990000",
+            ConversationId = "5511999990000",
+            Type = 0,
+            Text = "Meu CPF e 11111111111",
+            ReceivedAt = DateTimeOffset.UtcNow
+        });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        Assert.NotNull(saved);
+        Assert.Equal(JourneyStage.HandoffRequested, saved!.JourneyStage);
+    }
+
+    [Fact]
+    public async Task PostMessages_CustomerAcceptsProposalInRawText_AdvancesToProposalSelected()
+    {
+        // Reproduces a real stuck conversation: the customer said "Aceito essa proposta", but the
+        // Agent Runtime's own Intent came back as "confirm_agreement_request" - which
+        // JourneyTriggerClassifier classifies as ConfirmedAgreement (needs ProposalSelected
+        // already), not SelectedProposal, so the trigger table found no legal transition from
+        // ProposalAvailable and the stage never moved. ProposalSelectionDetector reads the
+        // customer's own message instead of the agent's paraphrase.
+        var agentRuntime = new Mock<IAgentRuntimeClient>();
+        agentRuntime
+            .Setup(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new AgentRuntimeResult
+            {
+                Intent = "confirm_agreement_request",
+                ReplyText = "Nao consigo confirmar ainda.",
+                RequiresHandoff = false
+            });
+        ConversationSession? saved = null;
+        var memoryClient = new Mock<IConversationMemoryClient>();
+        memoryClient
+            .Setup(c => c.GetOrCreateSessionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string conversationId, CancellationToken _) => new ConversationSession
+            {
+                ConversationId = conversationId,
+                CreatedAt = DateTimeOffset.UtcNow,
+                LastMessageAt = DateTimeOffset.UtcNow,
+                JourneyStage = JourneyStage.ProposalAvailable
+            });
+        memoryClient
+            .Setup(c => c.SaveSessionAsync(It.IsAny<ConversationSession>(), It.IsAny<CancellationToken>()))
+            .Callback<ConversationSession, CancellationToken>((session, _) => saved = session)
+            .Returns(Task.CompletedTask);
+        var client = CreateClient(
+            agentRuntime.Object,
+            conversationMemoryClient: memoryClient.Object,
+            seedConversationId: "5511999990000",
+            seedJourneyStage: JourneyStage.ProposalAvailable);
+
+        var response = await client.PostAsJsonAsync("/messages", new
+        {
+            MessageId = "wamid.proposal-select-1",
+            From = "5511999990000",
+            ConversationId = "5511999990000",
+            Type = 0,
+            Text = "Aceito essa proposta",
+            ReceivedAt = DateTimeOffset.UtcNow
+        });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        Assert.NotNull(saved);
+        Assert.Equal(JourneyStage.ProposalSelected, saved!.JourneyStage);
+    }
+
+    [Fact]
+    public async Task PostMessages_CustomerAsksQuestionAtProposalAvailable_StageUnchanged()
+    {
+        var agentRuntime = new Mock<IAgentRuntimeClient>();
+        agentRuntime
+            .Setup(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new AgentRuntimeResult { Intent = "faq", ReplyText = "Claro!", RequiresHandoff = false });
+        ConversationSession? saved = null;
+        var memoryClient = new Mock<IConversationMemoryClient>();
+        memoryClient
+            .Setup(c => c.GetOrCreateSessionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string conversationId, CancellationToken _) => new ConversationSession
+            {
+                ConversationId = conversationId,
+                CreatedAt = DateTimeOffset.UtcNow,
+                LastMessageAt = DateTimeOffset.UtcNow,
+                JourneyStage = JourneyStage.ProposalAvailable
+            });
+        memoryClient
+            .Setup(c => c.SaveSessionAsync(It.IsAny<ConversationSession>(), It.IsAny<CancellationToken>()))
+            .Callback<ConversationSession, CancellationToken>((session, _) => saved = session)
+            .Returns(Task.CompletedTask);
+        var client = CreateClient(
+            agentRuntime.Object,
+            conversationMemoryClient: memoryClient.Object,
+            seedConversationId: "5511999990000",
+            seedJourneyStage: JourneyStage.ProposalAvailable);
+
+        var response = await client.PostAsJsonAsync("/messages", new
+        {
+            MessageId = "wamid.proposal-select-2",
+            From = "5511999990000",
+            ConversationId = "5511999990000",
+            Type = 0,
+            Text = "Quanto fica o total se eu pagar em 6 vezes?",
+            ReceivedAt = DateTimeOffset.UtcNow
+        });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        Assert.NotNull(saved);
+        Assert.Equal(JourneyStage.ProposalAvailable, saved!.JourneyStage);
+    }
+
     private HttpClient CreateClient(
         IAgentRuntimeClient agentRuntimeClient,
         IChannelReplyClient? replyClient = null,

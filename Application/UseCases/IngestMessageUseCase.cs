@@ -103,32 +103,73 @@ public class IngestMessageUseCase(
             }
             else
             {
-                var trigger = JourneyTriggerClassifier.Classify(result.Intent);
-                if (JourneyStageTransitions.TryGetNext(previousStage, trigger, out var transitionedStage))
+                // JourneyMilestone is computed by agent-runtime-renegotiation from verified
+                // governed-tool outcomes (see journey-milestone-reporting), not from freeform
+                // Intent text - prefer it whenever present and it doesn't regress the stage.
+                // "Legal" here is deliberately just forward-or-equal in the enum's declaration
+                // order, not a (from, trigger) transition-table lookup: a milestone can validly
+                // jump several stages in one turn (e.g. Started -> ContractSelected when a
+                // single-contract customer identifies themselves and their contract in the same
+                // message), which the older trigger table - built for one hop per turn - doesn't
+                // model.
+                JourneyStage? milestoneStage = null;
+                if (!string.IsNullOrWhiteSpace(result.JourneyMilestone)
+                    && Enum.TryParse<JourneyStage>(result.JourneyMilestone, true, out var parsedMilestone)
+                    && (int)parsedMilestone >= (int)previousStage)
                 {
-                    nextStage = transitionedStage;
+                    milestoneStage = parsedMilestone;
+                }
+
+                if (milestoneStage is not null)
+                {
+                    nextStage = milestoneStage.Value;
                     metrics.Increment(
                         "orchestrator_journey_transitions_total",
                         ("from", previousStage.ToString()),
                         ("to", nextStage.ToString()),
-                        ("outcome", "applied"));
+                        ("outcome", "applied_milestone"));
                 }
-                else if (trigger != JourneyTrigger.None)
+                else if (ProposalSelectionDetector.IsProposalSelection(message, previousStage))
                 {
+                    // Reads the customer's own raw text, not the Agent Runtime's Intent label -
+                    // see ProposalSelectionDetector's doc comment for why the Intent-based path
+                    // doesn't reliably catch this hop.
+                    nextStage = JourneyStage.ProposalSelected;
                     metrics.Increment(
                         "orchestrator_journey_transitions_total",
                         ("from", previousStage.ToString()),
-                        ("to", previousStage.ToString()),
-                        ("outcome", "rejected"));
-                    metrics.Increment(
-                        "orchestrator_journey_triggers_total",
-                        ("trigger", trigger.ToString()),
-                        ("outcome", "rejected"));
-                    logger.LogInformation(
-                        "Rejected journey trigger {Trigger} from stage {Stage} for conversation {ConversationId}",
-                        trigger,
-                        previousStage,
-                        conversationId);
+                        ("to", nextStage.ToString()),
+                        ("outcome", "applied_customer_text"));
+                }
+                else
+                {
+                    var trigger = JourneyTriggerClassifier.Classify(result.Intent);
+                    if (JourneyStageTransitions.TryGetNext(previousStage, trigger, out var transitionedStage))
+                    {
+                        nextStage = transitionedStage;
+                        metrics.Increment(
+                            "orchestrator_journey_transitions_total",
+                            ("from", previousStage.ToString()),
+                            ("to", nextStage.ToString()),
+                            ("outcome", "applied"));
+                    }
+                    else if (trigger != JourneyTrigger.None)
+                    {
+                        metrics.Increment(
+                            "orchestrator_journey_transitions_total",
+                            ("from", previousStage.ToString()),
+                            ("to", previousStage.ToString()),
+                            ("outcome", "rejected"));
+                        metrics.Increment(
+                            "orchestrator_journey_triggers_total",
+                            ("trigger", trigger.ToString()),
+                            ("outcome", "rejected"));
+                        logger.LogInformation(
+                            "Rejected journey trigger {Trigger} from stage {Stage} for conversation {ConversationId}",
+                            trigger,
+                            previousStage,
+                            conversationId);
+                    }
                 }
 
                 // JourneyTriggerClassifier is keyword-based on the model's freeform Intent, which
@@ -340,6 +381,23 @@ public class IngestMessageUseCase(
     }
 }
 
+internal static class PortugueseTextNormalizer
+{
+    public static string RemoveDiacritics(string value)
+    {
+        var normalized = value.Normalize(NormalizationForm.FormD);
+        var builder = new StringBuilder(normalized.Length);
+        foreach (var character in normalized)
+        {
+            if (CharUnicodeInfo.GetUnicodeCategory(character) != UnicodeCategory.NonSpacingMark)
+            {
+                builder.Append(character);
+            }
+        }
+        return builder.ToString().Normalize(NormalizationForm.FormC);
+    }
+}
+
 internal static class ExplicitConfirmationDetector
 {
     private static readonly Regex PositiveConfirmation = new(
@@ -359,25 +417,50 @@ internal static class ExplicitConfirmationDetector
             return false;
         }
 
-        var normalized = RemoveDiacritics(value).ToLowerInvariant();
+        var normalized = PortugueseTextNormalizer.RemoveDiacritics(value).ToLowerInvariant();
         if (Regex.IsMatch(normalized, @"\b(nao|nunca|cancel|desist)\b"))
         {
             return false;
         }
         return PositiveConfirmation.IsMatch(normalized);
     }
+}
 
-    private static string RemoveDiacritics(string value)
+/// <summary>
+/// Design decision 5 (stabilize-renegotiation-journey-progression): ProposalAvailable ->
+/// ProposalSelected is fundamentally about what the *customer* decided, not a governed-tool
+/// outcome - there's no MCP tool call for "customer picked this proposal". JourneyTriggerClassifier
+/// classifies the Agent Runtime's own Intent, not the customer's words - confirmed live this
+/// mismatches: a customer message "Aceito essa proposta" produced Intent
+/// "confirm_agreement_request", which classifies as ConfirmedAgreement (needs ProposalSelected
+/// already) rather than SelectedProposal, so the transition table found no legal entry from
+/// ProposalAvailable and the stage never moved. Reads the customer's own raw message instead,
+/// mirroring ExplicitConfirmationDetector.
+/// </summary>
+internal static class ProposalSelectionDetector
+{
+    private static readonly Regex PositiveSelection = new(
+        @"\b(aceito|aceita|escolho|essa mesma|essa proposta|fechar essa|quero essa|pode ser essa|gostei dessa)\b",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    public static bool IsProposalSelection(InboundChannelMessage message, JourneyStage stage)
     {
-        var normalized = value.Normalize(NormalizationForm.FormD);
-        var builder = new StringBuilder(normalized.Length);
-        foreach (var character in normalized)
+        if (stage != JourneyStage.ProposalAvailable)
         {
-            if (CharUnicodeInfo.GetUnicodeCategory(character) != UnicodeCategory.NonSpacingMark)
-            {
-                builder.Append(character);
-            }
+            return false;
         }
-        return builder.ToString().Normalize(NormalizationForm.FormC);
+
+        var value = message.Interactive?.Title ?? message.Text;
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var normalized = PortugueseTextNormalizer.RemoveDiacritics(value).ToLowerInvariant();
+        if (Regex.IsMatch(normalized, @"\b(nao|nunca|cancel|desist)\b"))
+        {
+            return false;
+        }
+        return PositiveSelection.IsMatch(normalized);
     }
 }
