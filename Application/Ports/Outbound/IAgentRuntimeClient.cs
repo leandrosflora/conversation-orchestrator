@@ -20,6 +20,9 @@ public class AgentRuntimeRequest
     public string? ActiveSimulationId { get; init; }
     public string? ActiveAgreementId { get; init; }
     public string? ExplicitConfirmationMessageId { get; init; }
+    public string? ActiveContractId { get; init; }
+    public string? ActiveSimulationId { get; init; }
+    public string? ActiveAgreementId { get; init; }
 }
 
 public class AgentRuntimeResult
