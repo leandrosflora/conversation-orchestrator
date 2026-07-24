@@ -77,7 +77,10 @@ public class IngestMessageUseCase(
                     JourneyStage = previousStage.ToString(),
                     JourneyVersion = checkpoint.Version,
                     LastIntent = checkpoint.LastIntent,
-                    ExplicitConfirmationMessageId = confirmationMessageId
+                    ExplicitConfirmationMessageId = confirmationMessageId,
+                    ActiveContractId = checkpoint.ActiveContractId,
+                    ActiveSimulationId = checkpoint.ActiveSimulationId,
+                    ActiveAgreementId = checkpoint.ActiveAgreementId
                 },
                 cancellationToken);
 
@@ -86,6 +89,13 @@ public class IngestMessageUseCase(
                 ("outcome", ClassifyAgentOutcome(result)));
 
             var nextIntent = result.Intent ?? checkpoint.LastIntent;
+            // The Agent Runtime already echoes back the previous value when it has nothing new
+            // to report (see agent-runtime-renegotiation's core.py) - this fallback only matters
+            // for the AgentRuntimeResult.Unavailable() path, which has no way to know what the
+            // checkpoint held.
+            var nextActiveContractId = result.ActiveContractId ?? checkpoint.ActiveContractId;
+            var nextActiveSimulationId = result.ActiveSimulationId ?? checkpoint.ActiveSimulationId;
+            var nextActiveAgreementId = result.ActiveAgreementId ?? checkpoint.ActiveAgreementId;
             var nextStage = previousStage;
             if (result.RequiresHandoff)
             {
@@ -144,7 +154,10 @@ public class IngestMessageUseCase(
                     nextStage,
                     nextIntent,
                     checkpoint.Version,
-                    effects),
+                    effects,
+                    nextActiveContractId,
+                    nextActiveSimulationId,
+                    nextActiveAgreementId),
                 cancellationToken);
 
             metrics.Increment("orchestrator_journey_outcomes_total", ("outcome", outcome));

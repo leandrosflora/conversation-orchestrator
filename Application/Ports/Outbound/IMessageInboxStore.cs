@@ -15,7 +15,10 @@ public sealed record ConversationCheckpoint(
     string? LastIntent,
     long Version,
     DateTimeOffset? LastReceivedAt,
-    string? LastMessageId);
+    string? LastMessageId,
+    string? ActiveContractId = null,
+    string? ActiveSimulationId = null,
+    string? ActiveAgreementId = null);
 
 public sealed record InboxLease(
     InboxAcquireResult Result,
@@ -34,7 +37,10 @@ public sealed record CompleteMessageCommand(
     JourneyStage JourneyStage,
     string? LastIntent,
     long ExpectedVersion,
-    IReadOnlyCollection<DurableEffect> Effects);
+    IReadOnlyCollection<DurableEffect> Effects,
+    string? ActiveContractId = null,
+    string? ActiveSimulationId = null,
+    string? ActiveAgreementId = null);
 
 public interface IMessageInboxStore
 {
