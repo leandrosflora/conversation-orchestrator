@@ -405,6 +405,60 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
     }
 
     [Fact]
+    public async Task PostMessages_NewActiveContractIdAdvancesStageEvenWithUnrecognizedIntent()
+    {
+        // Reproduces a real stuck conversation: the model reported Intent="consultar_debitos" (a
+        // tool name, not a trigger keyword JourneyTriggerClassifier recognizes) while also
+        // reporting ActiveContractId for the first time - proof identification/contract lookup
+        // had genuinely succeeded this turn. Without the structural fallback, the stage would sit
+        // at IdentificationPending forever since no trigger ever classifies from that intent.
+        var agentRuntime = new Mock<IAgentRuntimeClient>();
+        agentRuntime
+            .Setup(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new AgentRuntimeResult
+            {
+                Intent = "consultar_debitos",
+                ReplyText = "Ja confirmei seu contrato.",
+                RequiresHandoff = false,
+                ActiveContractId = "11111111111-contract-1"
+            });
+        ConversationSession? saved = null;
+        var memoryClient = new Mock<IConversationMemoryClient>();
+        memoryClient
+            .Setup(c => c.GetOrCreateSessionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string conversationId, CancellationToken _) => new ConversationSession
+            {
+                ConversationId = conversationId,
+                CreatedAt = DateTimeOffset.UtcNow,
+                LastMessageAt = DateTimeOffset.UtcNow,
+                JourneyStage = JourneyStage.IdentificationPending
+            });
+        memoryClient
+            .Setup(c => c.SaveSessionAsync(It.IsAny<ConversationSession>(), It.IsAny<CancellationToken>()))
+            .Callback<ConversationSession, CancellationToken>((session, _) => saved = session)
+            .Returns(Task.CompletedTask);
+        var client = CreateClient(
+            agentRuntime.Object,
+            conversationMemoryClient: memoryClient.Object,
+            seedConversationId: "5511999990000",
+            seedJourneyStage: JourneyStage.IdentificationPending);
+
+        var response = await client.PostAsJsonAsync("/messages", new
+        {
+            MessageId = "wamid.stage-3",
+            From = "5511999990000",
+            ConversationId = "5511999990000",
+            Type = 0,
+            Text = "Meu CPF e 11111111111",
+            ReceivedAt = DateTimeOffset.UtcNow
+        });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        Assert.NotNull(saved);
+        Assert.Equal(JourneyStage.ContractSelected, saved!.JourneyStage);
+    }
+
+    [Fact]
     public async Task PostMessages_RequiresHandoff_OverridesOtherwiseLegalTransition()
     {
         var agentRuntime = new Mock<IAgentRuntimeClient>();

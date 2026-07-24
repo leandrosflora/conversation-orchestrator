@@ -130,6 +130,29 @@ public class IngestMessageUseCase(
                         previousStage,
                         conversationId);
                 }
+
+                // JourneyTriggerClassifier is keyword-based on the model's freeform Intent, which
+                // doesn't always name a trigger matching what actually happened (e.g. Intent
+                // comes back as a tool name like "consultar_debitos" rather than something
+                // classifying as ProvidedIdentification/SelectedContract) - confirmed live: a
+                // real conversation got permanently stuck at IdentificationPending this way, with
+                // ActiveContractId already populated proving identification and contract lookup
+                // had genuinely succeeded. ActiveContractId newly appearing is unambiguous
+                // structural proof of that progress, independent of how the model phrased its
+                // intent - use it as a fallback so the stage doesn't wait forever for a keyword
+                // match that may never come.
+                if (nextStage == previousStage
+                    && nextActiveContractId is not null
+                    && checkpoint.ActiveContractId is null
+                    && previousStage is JourneyStage.Started or JourneyStage.IdentificationPending or JourneyStage.CustomerIdentified)
+                {
+                    nextStage = JourneyStage.ContractSelected;
+                    metrics.Increment(
+                        "orchestrator_journey_transitions_total",
+                        ("from", previousStage.ToString()),
+                        ("to", nextStage.ToString()),
+                        ("outcome", "applied_structural_fallback"));
+                }
             }
 
             var now = DateTimeOffset.UtcNow;
