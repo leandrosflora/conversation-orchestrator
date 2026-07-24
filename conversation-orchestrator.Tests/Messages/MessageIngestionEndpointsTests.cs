@@ -206,6 +206,62 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
     }
 
     [Fact]
+    public async Task PostMessages_PersistsActiveRenegotiationStateAcrossTurns()
+    {
+        // agent-runtime-renegotiation can't recover a simulation_id from chat history alone (it's
+        // never spoken to the customer), so the Orchestrator round-trips ActiveContractId/
+        // ActiveSimulationId/ActiveAgreementId through ConversationCheckpoint <-> AgentRuntimeRequest
+        // the same way it already does for JourneyStage/LastIntent. This is what lets a later turn
+        // (e.g. confirmar_acordo) reference a simulation created in an earlier one.
+        var agentRuntime = new Mock<IAgentRuntimeClient>();
+        agentRuntime
+            .SetupSequence(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new AgentRuntimeResult
+            {
+                Intent = "simular_proposta",
+                ReplyText = "Simulei uma proposta para voce.",
+                RequiresHandoff = false,
+                ActiveContractId = "contract-1",
+                ActiveSimulationId = "sim-1"
+            })
+            .ReturnsAsync(new AgentRuntimeResult
+            {
+                Intent = "confirmar_acordo",
+                ReplyText = "Acordo confirmado!",
+                RequiresHandoff = false
+            });
+        var client = CreateClient(agentRuntime.Object);
+
+        await client.PostAsJsonAsync("/messages", new
+        {
+            MessageId = "wamid.state-1",
+            From = "5511999990000",
+            ConversationId = "5511999990000",
+            Type = 0,
+            Text = "Quero simular minha divida",
+            ReceivedAt = DateTimeOffset.UtcNow
+        });
+        await client.PostAsJsonAsync("/messages", new
+        {
+            MessageId = "wamid.state-2",
+            From = "5511999990000",
+            ConversationId = "5511999990000",
+            Type = 0,
+            Text = "Confirmo",
+            ReceivedAt = DateTimeOffset.UtcNow
+        });
+
+        agentRuntime.Verify(
+            a => a.ProcessAsync(
+                It.Is<AgentRuntimeRequest>(r =>
+                    r.MessageId == "wamid.state-2"
+                    && r.ActiveContractId == "contract-1"
+                    && r.ActiveSimulationId == "sim-1"),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
     public async Task PostMessages_ReplyDelivered_AuditRecordedRegardlessOfOutcome()
     {
         var agentRuntime = new Mock<IAgentRuntimeClient>();
@@ -509,7 +565,10 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
                 command.LastIntent,
                 command.ExpectedVersion + 1,
                 command.ReceivedAt,
-                command.MessageId);
+                command.MessageId,
+                command.ActiveContractId,
+                command.ActiveSimulationId,
+                command.ActiveAgreementId);
 
             foreach (var effect in command.Effects)
             {
