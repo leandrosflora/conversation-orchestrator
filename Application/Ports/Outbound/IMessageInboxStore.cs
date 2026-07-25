@@ -22,7 +22,8 @@ public sealed record ConversationCheckpoint(
     DateTimeOffset? LastReceivedAt,
     string? LastMessageId,
     string? SkillId = null,
-    string? StructuredState = null)
+    string? StructuredState = null,
+    DateTimeOffset? SessionStartedAt = null)
 {
     public const string StartedState = "Started";
 }
@@ -46,7 +47,8 @@ public sealed record CompleteMessageCommand(
     long ExpectedVersion,
     IReadOnlyCollection<DurableEffect> Effects,
     string? SkillId = null,
-    string? StructuredState = null);
+    string? StructuredState = null,
+    DateTimeOffset? SessionStartedAt = null);
 
 public interface IMessageInboxStore
 {

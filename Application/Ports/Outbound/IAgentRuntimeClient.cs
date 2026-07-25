@@ -25,6 +25,16 @@ public class AgentRuntimeRequest
     public long JourneyVersion { get; init; }
     public string? LastIntent { get; init; }
     public JsonDocument? StructuredState { get; init; }
+    /// <summary>True only on the turn the 15-minute session window was just found expired and
+    /// reset - lets the agent tell the customer explicitly instead of silently re-asking for
+    /// identification as if nothing had happened. See journey-state-machine's session-window
+    /// requirement.</summary>
+    public bool SessionReset { get; init; }
+    /// <summary>Start of the current 15-minute session window (bumped to now on reset) - the
+    /// agent uses this to discard any conversation history from before the window started, so a
+    /// reset conversation can't fall back on identity/context the customer provided in an expired
+    /// session.</summary>
+    public DateTimeOffset? SessionStartedAt { get; init; }
 }
 
 public class AgentRuntimeResult

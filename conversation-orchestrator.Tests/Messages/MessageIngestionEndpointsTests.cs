@@ -461,6 +461,142 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
     }
 
     [Fact]
+    public async Task PostMessages_SessionPast15Minutes_ResetsStateAndFlagsSessionReset()
+    {
+        // Session-window requirement: a conversation is capped at 15 minutes from its own start,
+        // not an inactivity timeout - a customer who kept messaging every few minutes still gets
+        // reset once the total elapses. The agent must see a clean slate (State/StructuredState
+        // null) and know this is a reset, not a brand new conversation, so it can tell the
+        // customer explicitly instead of silently re-asking as if nothing happened.
+        AgentRuntimeRequest? captured = null;
+        var agentRuntime = new Mock<IAgentRuntimeClient>();
+        agentRuntime
+            .Setup(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
+            .Callback<AgentRuntimeRequest, CancellationToken>((request, _) => captured = request)
+            .ReturnsAsync(new AgentRuntimeResult
+            {
+                Intent = "pedir_cpf",
+                ReplyText = "Sua sessao anterior expirou. Pode confirmar seu CPF?",
+                RequiresHandoff = false
+            });
+        var client = CreateClient(
+            agentRuntime.Object,
+            seedConversationId: "5511999990000",
+            seedState: "ProposalAvailable",
+            seedSessionStartedAt: DateTimeOffset.UtcNow.AddMinutes(-20));
+
+        var beforeSend = DateTimeOffset.UtcNow;
+        var response = await client.PostAsJsonAsync("/messages", new
+        {
+            MessageId = "wamid.session-expired-1",
+            From = "5511999990000",
+            ConversationId = "5511999990000",
+            Type = 0,
+            Text = "oi",
+            ReceivedAt = DateTimeOffset.UtcNow
+        });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        Assert.NotNull(captured);
+        Assert.Null(captured!.State);
+        Assert.Null(captured.StructuredState);
+        Assert.True(captured.SessionReset);
+        Assert.NotNull(captured.SessionStartedAt);
+        Assert.True(captured.SessionStartedAt!.Value >= beforeSend);
+    }
+
+    [Fact]
+    public async Task PostMessages_SessionWithin15Minutes_DoesNotReset()
+    {
+        AgentRuntimeRequest? captured = null;
+        var agentRuntime = new Mock<IAgentRuntimeClient>();
+        agentRuntime
+            .Setup(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
+            .Callback<AgentRuntimeRequest, CancellationToken>((request, _) => captured = request)
+            .ReturnsAsync(new AgentRuntimeResult
+            {
+                Intent = "faq",
+                ReplyText = "Claro!",
+                RequiresHandoff = false,
+                State = "ProposalAvailable"
+            });
+        var sessionStartedAt = DateTimeOffset.UtcNow.AddMinutes(-2);
+        var client = CreateClient(
+            agentRuntime.Object,
+            seedConversationId: "5511999990000",
+            seedState: "ProposalAvailable",
+            seedSessionStartedAt: sessionStartedAt);
+
+        var response = await client.PostAsJsonAsync("/messages", new
+        {
+            MessageId = "wamid.session-active-1",
+            From = "5511999990000",
+            ConversationId = "5511999990000",
+            Type = 0,
+            Text = "quanto fica em 6x?",
+            ReceivedAt = DateTimeOffset.UtcNow
+        });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        Assert.NotNull(captured);
+        Assert.Equal("ProposalAvailable", captured!.State);
+        Assert.False(captured.SessionReset);
+        Assert.Equal(sessionStartedAt, captured.SessionStartedAt);
+    }
+
+    [Fact]
+    public async Task PostMessages_SessionExpiredWithNoNewStateFromAgent_PersistsStartedNotStaleState()
+    {
+        // If the agent makes no progress on the reset turn itself (e.g. it just asks for the CPF
+        // again), the persisted state must land on a real clean slate (Started) - falling back to
+        // the *expired* session's old stage here would silently undo the reset.
+        var agentRuntime = new Mock<IAgentRuntimeClient>();
+        agentRuntime
+            .Setup(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new AgentRuntimeResult
+            {
+                Intent = "pedir_cpf",
+                ReplyText = "Sua sessao anterior expirou. Pode confirmar seu CPF?",
+                RequiresHandoff = false
+            });
+        ConversationSession? saved = null;
+        var memoryClient = new Mock<IConversationMemoryClient>();
+        memoryClient
+            .Setup(c => c.GetOrCreateSessionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string conversationId, CancellationToken _) => new ConversationSession
+            {
+                ConversationId = conversationId,
+                CreatedAt = DateTimeOffset.UtcNow,
+                LastMessageAt = DateTimeOffset.UtcNow,
+                JourneyStage = "AgreementConfirmed"
+            });
+        memoryClient
+            .Setup(c => c.SaveSessionAsync(It.IsAny<ConversationSession>(), It.IsAny<CancellationToken>()))
+            .Callback<ConversationSession, CancellationToken>((session, _) => saved = session)
+            .Returns(Task.CompletedTask);
+        var client = CreateClient(
+            agentRuntime.Object,
+            conversationMemoryClient: memoryClient.Object,
+            seedConversationId: "5511999990000",
+            seedState: "AgreementConfirmed",
+            seedSessionStartedAt: DateTimeOffset.UtcNow.AddMinutes(-20));
+
+        var response = await client.PostAsJsonAsync("/messages", new
+        {
+            MessageId = "wamid.session-expired-2",
+            From = "5511999990000",
+            ConversationId = "5511999990000",
+            Type = 0,
+            Text = "oi",
+            ReceivedAt = DateTimeOffset.UtcNow
+        });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        Assert.NotNull(saved);
+        Assert.Equal("Started", saved!.JourneyStage);
+    }
+
+    [Fact]
     public async Task PostMessages_RequiresHandoff_OverridesSkillReportedState()
     {
         var agentRuntime = new Mock<IAgentRuntimeClient>();
@@ -556,7 +692,8 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
         IMessageInboxStore? inboxStore = null,
         IAgentSkillRegistry? skillRegistry = null,
         string? seedConversationId = null,
-        string? seedState = null)
+        string? seedState = null,
+        DateTimeOffset? seedSessionStartedAt = null)
     {
         var reply = replyClient ?? Mock.Of<IChannelReplyClient>();
         var events = eventPublisher ?? Mock.Of<IConversationEventPublisher>();
@@ -590,7 +727,7 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
 
                 services.RemoveAll<IMessageInboxStore>();
                 services.AddSingleton(inboxStore ?? new InMemoryMessageInboxStore(
-                    reply, events, handoff, audit, memory, seedConversationId, seedState));
+                    reply, events, handoff, audit, memory, seedConversationId, seedState, seedSessionStartedAt));
             });
         });
 
@@ -626,13 +763,18 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
         IAuditServiceClient auditClient,
         IConversationMemoryClient memoryClient,
         string? seedConversationId = null,
-        string? seedState = null) : IMessageInboxStore
+        string? seedState = null,
+        DateTimeOffset? seedSessionStartedAt = null) : IMessageInboxStore
     {
         private readonly HashSet<string> _completed = new();
         private readonly HashSet<string> _inProgress = new();
         private readonly Dictionary<string, ConversationCheckpoint> _checkpoints =
             seedConversationId is not null && seedState is not null
-                ? new() { [seedConversationId] = new ConversationCheckpoint(seedState, null, 0, null, null) }
+                ? new()
+                {
+                    [seedConversationId] = new ConversationCheckpoint(
+                        seedState, null, 0, null, null, null, null, seedSessionStartedAt)
+                }
                 : new();
 
         public Task<InboxLease> TryAcquireAsync(
@@ -669,7 +811,8 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
                 command.ReceivedAt,
                 command.MessageId,
                 command.SkillId,
-                command.StructuredState);
+                command.StructuredState,
+                command.SessionStartedAt);
 
             foreach (var effect in command.Effects)
             {
