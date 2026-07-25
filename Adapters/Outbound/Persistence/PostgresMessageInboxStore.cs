@@ -2,7 +2,6 @@ using Microsoft.Extensions.Options;
 using Npgsql;
 using conversation_orchestrator.Application.Ports.Outbound;
 using conversation_orchestrator.Configuration;
-using conversation_orchestrator.Domain;
 
 namespace conversation_orchestrator.Adapters.Outbound.Persistence;
 
@@ -92,7 +91,7 @@ public sealed class PostgresMessageInboxStore(
         {
             ensureState.Parameters.AddWithValue("tenant_id", tenantId);
             ensureState.Parameters.AddWithValue("conversation_id", conversationId);
-            ensureState.Parameters.AddWithValue("journey_stage", JourneyStage.Started.ToString());
+            ensureState.Parameters.AddWithValue("journey_stage", ConversationCheckpoint.StartedState);
             await ensureState.ExecuteNonQueryAsync(cancellationToken);
         }
 
@@ -105,7 +104,7 @@ public sealed class PostgresMessageInboxStore(
               AND conversation_id = @conversation_id
               AND (processing_lease_until IS NULL OR processing_lease_until < now())
             RETURNING journey_stage, last_intent, version, last_received_at, last_message_id,
-                      active_contract_id, active_simulation_id, active_agreement_id;
+                      skill_id, structured_state::text;
             """;
 
         ConversationCheckpoint? checkpoint = null;
@@ -118,16 +117,14 @@ public sealed class PostgresMessageInboxStore(
             await using var reader = await acquireConversation.ExecuteReaderAsync(cancellationToken);
             if (await reader.ReadAsync(cancellationToken))
             {
-                var stageText = reader.GetString(0);
                 checkpoint = new ConversationCheckpoint(
-                    Enum.TryParse<JourneyStage>(stageText, true, out var stage) ? stage : JourneyStage.Started,
+                    reader.GetString(0),
                     reader.IsDBNull(1) ? null : reader.GetString(1),
                     reader.GetInt64(2),
                     reader.IsDBNull(3) ? null : reader.GetFieldValue<DateTimeOffset>(3),
                     reader.IsDBNull(4) ? null : reader.GetString(4),
                     reader.IsDBNull(5) ? null : reader.GetString(5),
-                    reader.IsDBNull(6) ? null : reader.GetString(6),
-                    reader.IsDBNull(7) ? null : reader.GetString(7));
+                    reader.IsDBNull(6) ? null : reader.GetString(6));
             }
         }
 
@@ -180,9 +177,8 @@ public sealed class PostgresMessageInboxStore(
                 version = version + 1,
                 last_received_at = @received_at,
                 last_message_id = @message_id,
-                active_contract_id = @active_contract_id,
-                active_simulation_id = @active_simulation_id,
-                active_agreement_id = @active_agreement_id,
+                skill_id = @skill_id,
+                structured_state = @structured_state::jsonb,
                 processing_message_id = NULL,
                 processing_lease_until = NULL,
                 updated_at = now()
@@ -195,13 +191,12 @@ public sealed class PostgresMessageInboxStore(
         {
             updateState.Parameters.AddWithValue("tenant_id", command.TenantId);
             updateState.Parameters.AddWithValue("conversation_id", command.ConversationId);
-            updateState.Parameters.AddWithValue("journey_stage", command.JourneyStage.ToString());
+            updateState.Parameters.AddWithValue("journey_stage", command.State);
             updateState.Parameters.AddWithValue("last_intent", (object?)command.LastIntent ?? DBNull.Value);
             updateState.Parameters.AddWithValue("received_at", command.ReceivedAt);
             updateState.Parameters.AddWithValue("message_id", command.MessageId);
-            updateState.Parameters.AddWithValue("active_contract_id", (object?)command.ActiveContractId ?? DBNull.Value);
-            updateState.Parameters.AddWithValue("active_simulation_id", (object?)command.ActiveSimulationId ?? DBNull.Value);
-            updateState.Parameters.AddWithValue("active_agreement_id", (object?)command.ActiveAgreementId ?? DBNull.Value);
+            updateState.Parameters.AddWithValue("skill_id", (object?)command.SkillId ?? DBNull.Value);
+            updateState.Parameters.AddWithValue("structured_state", command.StructuredState ?? "{}");
             updateState.Parameters.AddWithValue("expected_version", command.ExpectedVersion);
             var updated = await updateState.ExecuteNonQueryAsync(cancellationToken);
             if (updated != 1)
@@ -513,9 +508,11 @@ public sealed class PostgresMessageInboxStore(
                 );
                 CREATE INDEX IF NOT EXISTS idx_conversation_state_processing_lease
                     ON ops.conversation_state (processing_lease_until);
-                ALTER TABLE ops.conversation_state ADD COLUMN IF NOT EXISTS active_contract_id text;
-                ALTER TABLE ops.conversation_state ADD COLUMN IF NOT EXISTS active_simulation_id text;
-                ALTER TABLE ops.conversation_state ADD COLUMN IF NOT EXISTS active_agreement_id text;
+                ALTER TABLE ops.conversation_state DROP COLUMN IF EXISTS active_contract_id;
+                ALTER TABLE ops.conversation_state DROP COLUMN IF EXISTS active_simulation_id;
+                ALTER TABLE ops.conversation_state DROP COLUMN IF EXISTS active_agreement_id;
+                ALTER TABLE ops.conversation_state ADD COLUMN IF NOT EXISTS skill_id text;
+                ALTER TABLE ops.conversation_state ADD COLUMN IF NOT EXISTS structured_state jsonb NOT NULL DEFAULT '{}'::jsonb;
 
                 CREATE TABLE IF NOT EXISTS ops.orchestrator_outbox (
                     outbox_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

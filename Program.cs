@@ -28,8 +28,10 @@ builder.Services.PostConfigure<JwtBearerOptions>(
     JwtBearerDefaults.AuthenticationScheme,
     options => options.MapInboundClaims = false);
 
-builder.Services.AddOptions<AgentRuntimeOptions>()
-    .Bind(builder.Configuration.GetSection(AgentRuntimeOptions.SectionName));
+builder.Services.AddOptions<AgentSkillOptions>()
+    .Bind(builder.Configuration.GetSection(AgentSkillOptions.SectionName));
+builder.Services.AddOptions<TenantSkillOptions>()
+    .Bind(builder.Configuration.GetSection(TenantSkillOptions.SectionName));
 builder.Services.AddOptions<ChannelBffOptions>()
     .Bind(builder.Configuration.GetSection(ChannelBffOptions.SectionName));
 builder.Services.AddOptions<HandoffServiceOptions>()
@@ -71,25 +73,34 @@ builder.Services.AddSingleton<PostgresMessageInboxStore>();
 builder.Services.AddSingleton<IMessageInboxStore>(sp => sp.GetRequiredService<PostgresMessageInboxStore>());
 builder.Services.AddSingleton<IOutboxStore>(sp => sp.GetRequiredService<PostgresMessageInboxStore>());
 
-builder.Services.AddHttpClient<IAgentRuntimeClient, AgentRuntimeClient>((sp, client) =>
-    {
-        var options = sp.GetRequiredService<IOptions<AgentRuntimeOptions>>().Value;
-        client.BaseAddress = new Uri(options.BaseUrl);
-    })
-    .AddHttpMessageHandler(sp => new InternalRequestHandler(
-        sp.GetRequiredService<InternalTokenService>(),
-        sp.GetRequiredService<IOptions<InternalAuthOptions>>(),
-        sp.GetRequiredService<TenantContext>(),
-        "agent-runtime-renegotiation"))
-    .AddStandardResilienceHandler(options =>
-    {
-        options.AttemptTimeout.Timeout = TimeSpan.FromSeconds(45);
-        options.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(60);
-        options.CircuitBreaker.SamplingDuration = TimeSpan.FromSeconds(90);
-        options.Retry.MaxRetryAttempts = 2;
-        options.Retry.Delay = TimeSpan.FromMilliseconds(200);
-        options.Retry.DisableForUnsafeHttpMethods();
-    });
+// One named HttpClient per configured skill (read directly from configuration, same way
+// otelEndpoint is above - configuration is available synchronously before builder.Build()).
+// Each gets the same auth/resilience pipeline every skill's Agent Runtime call needs, regardless
+// of which business domain it serves.
+var agentSkills = builder.Configuration.GetSection(AgentSkillOptions.SectionName).Get<AgentSkillOptions>()
+    ?? new AgentSkillOptions();
+foreach (var skill in agentSkills.Skills)
+{
+    builder.Services.AddHttpClient(AgentSkillRegistry.HttpClientName(skill.Id), client =>
+        {
+            client.BaseAddress = new Uri(skill.BaseUrl);
+        })
+        .AddHttpMessageHandler(sp => new InternalRequestHandler(
+            sp.GetRequiredService<InternalTokenService>(),
+            sp.GetRequiredService<IOptions<InternalAuthOptions>>(),
+            sp.GetRequiredService<TenantContext>(),
+            skill.DownstreamServiceName ?? skill.Id))
+        .AddStandardResilienceHandler(options =>
+        {
+            options.AttemptTimeout.Timeout = TimeSpan.FromSeconds(45);
+            options.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(60);
+            options.CircuitBreaker.SamplingDuration = TimeSpan.FromSeconds(90);
+            options.Retry.MaxRetryAttempts = 2;
+            options.Retry.Delay = TimeSpan.FromMilliseconds(200);
+            options.Retry.DisableForUnsafeHttpMethods();
+        });
+}
+builder.Services.AddSingleton<IAgentSkillRegistry, AgentSkillRegistry>();
 
 builder.Services.AddHttpClient<IChannelReplyClient, ChannelReplyClient>((sp, client) =>
     {

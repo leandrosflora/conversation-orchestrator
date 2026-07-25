@@ -1,3 +1,5 @@
+using System.Text.Json;
+
 namespace conversation_orchestrator.Application.Ports.Outbound;
 
 public interface IAgentRuntimeClient
@@ -6,6 +8,12 @@ public interface IAgentRuntimeClient
     Task<AgentRuntimeResult> ProcessAsync(AgentRuntimeRequest request, CancellationToken cancellationToken);
 }
 
+/// <summary>
+/// Skill-agnostic wire contract to whichever Agent Runtime agent-skill-registry resolves for the
+/// conversation. State/StructuredState are opaque to the orchestrator - see journey-state-machine.
+/// ExplicitConfirmationMessageId (renegotiation-specific customer-text judgment) is deliberately
+/// absent - that judgment now lives in the agent, which already sees the raw message text.
+/// </summary>
 public class AgentRuntimeRequest
 {
     public required string TenantId { get; init; }
@@ -13,28 +21,27 @@ public class AgentRuntimeRequest
     public required string MessageId { get; init; }
     public required string MessageType { get; init; }
     public string? Text { get; init; }
-    public string? JourneyStage { get; init; }
+    public string? State { get; init; }
     public long JourneyVersion { get; init; }
     public string? LastIntent { get; init; }
-    public string? ExplicitConfirmationMessageId { get; init; }
-    public string? ActiveContractId { get; init; }
-    public string? ActiveSimulationId { get; init; }
-    public string? ActiveAgreementId { get; init; }
+    public JsonDocument? StructuredState { get; init; }
 }
 
 public class AgentRuntimeResult
 {
     public const string AgentRuntimeUnavailableReason = "agent_runtime_unavailable";
 
+    /// <summary>No skill was assigned to the tenant, or the assigned/pinned skill id isn't (or
+    /// is no longer) in the configured agent-skill-registry list.</summary>
+    public const string SkillNotConfiguredReason = "skill_not_configured";
+
     public string? Intent { get; init; }
     public double Confidence { get; init; }
     public string? ReplyText { get; init; }
     public required bool RequiresHandoff { get; init; }
     public string? HandoffReason { get; init; }
-    public string? ActiveContractId { get; init; }
-    public string? ActiveSimulationId { get; init; }
-    public string? ActiveAgreementId { get; init; }
-    public string? JourneyMilestone { get; init; }
+    public string? State { get; init; }
+    public JsonDocument? StructuredState { get; init; }
 
     public static AgentRuntimeResult Unavailable() => new()
     {
@@ -43,5 +50,14 @@ public class AgentRuntimeResult
         ReplyText = null,
         RequiresHandoff = true,
         HandoffReason = AgentRuntimeUnavailableReason
+    };
+
+    public static AgentRuntimeResult SkillNotConfigured() => new()
+    {
+        Intent = null,
+        Confidence = 0,
+        ReplyText = null,
+        RequiresHandoff = true,
+        HandoffReason = SkillNotConfiguredReason
     };
 }

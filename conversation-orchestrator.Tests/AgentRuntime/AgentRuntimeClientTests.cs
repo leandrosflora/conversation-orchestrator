@@ -118,6 +118,29 @@ public class AgentRuntimeClientTests
         return provider.GetRequiredService<IAgentRuntimeClient>();
     }
 
+    [Fact]
+    public async Task ProcessAsync_StructuredStateRoundTripsWithoutInspection()
+    {
+        using var structuredState = System.Text.Json.JsonDocument.Parse("""{"contract_id":"c-1"}""");
+        var expected = new AgentRuntimeResult
+        {
+            RequiresHandoff = false,
+            State = "ContractSelected",
+            StructuredState = structuredState
+        };
+        var handler = new StubHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = JsonContent.Create(expected)
+        });
+        var client = BuildClient(handler);
+
+        var result = await client.ProcessAsync(SampleRequest(), CancellationToken.None);
+
+        Assert.Equal("ContractSelected", result.State);
+        Assert.NotNull(result.StructuredState);
+        Assert.Equal("c-1", result.StructuredState!.RootElement.GetProperty("contract_id").GetString());
+    }
+
     private static AgentRuntimeRequest SampleRequest() => new()
     {
         TenantId = "00000000-0000-0000-0000-000000000001",
@@ -125,6 +148,6 @@ public class AgentRuntimeClientTests
         MessageId = "wamid.sample",
         MessageType = "Text",
         Text = "Ola",
-        JourneyStage = "started"
+        State = "started"
     };
 }
