@@ -6,7 +6,6 @@ using conversation_orchestrator.Adapters.Outbound.Persistence;
 using conversation_orchestrator.Application.Outbox;
 using conversation_orchestrator.Application.Ports.Outbound;
 using conversation_orchestrator.Configuration;
-using conversation_orchestrator.Domain;
 using Xunit;
 
 namespace conversation_orchestrator.Tests.Outbox;
@@ -58,7 +57,7 @@ public sealed class PostgresMessageInboxStoreDispatchSignalTests : IAsyncLifetim
 
         await _store.CompleteAsync(
             new CompleteMessageCommand(
-                tenantId, "msg-1", conversationId, DateTimeOffset.UtcNow, JourneyStage.Started, null,
+                tenantId, "msg-1", conversationId, DateTimeOffset.UtcNow, ConversationCheckpoint.StartedState, null,
                 turn.Checkpoint!.Version,
                 [new DurableEffect(OutboxEffectTypes.ChannelReply, $"reply:{conversationId}:1", "{}")]),
             CancellationToken.None);
@@ -94,7 +93,7 @@ public sealed class PostgresMessageInboxStoreDispatchSignalTests : IAsyncLifetim
             tenantId, "msg-1", conversationId, DateTimeOffset.UtcNow, CancellationToken.None);
         await _store.CompleteAsync(
             new CompleteMessageCommand(
-                tenantId, "msg-1", conversationId, DateTimeOffset.UtcNow, JourneyStage.Started, null,
+                tenantId, "msg-1", conversationId, DateTimeOffset.UtcNow, ConversationCheckpoint.StartedState, null,
                 turn1.Checkpoint!.Version,
                 [new DurableEffect(OutboxEffectTypes.ChannelReply, $"reply:{conversationId}:1", "{}")]),
             CancellationToken.None);
@@ -103,7 +102,7 @@ public sealed class PostgresMessageInboxStoreDispatchSignalTests : IAsyncLifetim
             tenantId, "msg-2", conversationId, DateTimeOffset.UtcNow.AddSeconds(1), CancellationToken.None);
         await _store.CompleteAsync(
             new CompleteMessageCommand(
-                tenantId, "msg-2", conversationId, DateTimeOffset.UtcNow.AddSeconds(1), JourneyStage.Started, null,
+                tenantId, "msg-2", conversationId, DateTimeOffset.UtcNow.AddSeconds(1), ConversationCheckpoint.StartedState, null,
                 turn2.Checkpoint!.Version,
                 [new DurableEffect(OutboxEffectTypes.ChannelReply, $"reply:{conversationId}:2", "{}")]),
             CancellationToken.None);

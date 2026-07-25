@@ -25,16 +25,13 @@ public class ConversationMemoryClient(
                 var body = await response.Content.ReadFromJsonAsync<SessionResponseDto>(cancellationToken);
                 if (body?.Data is not null)
                 {
-                    var journeyStage = Enum.TryParse<JourneyStage>(body.Data.JourneyStage, true, out var parsed)
-                        ? parsed
-                        : JourneyStage.Started;
                     metrics.Increment("orchestrator_memory_operations_total", ("operation", "get_session"), ("outcome", "success"));
                     return new ConversationSession
                     {
                         ConversationId = conversationId,
                         CreatedAt = body.Data.CreatedAt,
                         LastMessageAt = timeProvider.GetUtcNow(),
-                        JourneyStage = journeyStage,
+                        JourneyStage = body.Data.JourneyStage,
                         LastIntent = body.Data.LastIntent
                     };
                 }
@@ -52,7 +49,7 @@ public class ConversationMemoryClient(
             ConversationId = conversationId,
             CreatedAt = now,
             LastMessageAt = now,
-            JourneyStage = JourneyStage.Started
+            JourneyStage = "Started"
         };
     }
 
@@ -65,7 +62,7 @@ public class ConversationMemoryClient(
             Data = new SessionDataDto
             {
                 CreatedAt = session.CreatedAt,
-                JourneyStage = session.JourneyStage.ToString(),
+                JourneyStage = session.JourneyStage,
                 LastIntent = session.LastIntent
             }
         };

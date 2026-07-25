@@ -164,16 +164,13 @@ public sealed class OutboxDispatcherService(
             case OutboxEffectTypes.MemorySaveSession:
             {
                 var payload = Deserialize<MemorySaveSessionEffect>(envelope.Payload);
-                var stage = Enum.TryParse<JourneyStage>(payload.JourneyStage, true, out var parsed)
-                    ? parsed
-                    : JourneyStage.Started;
                 await services.GetRequiredService<IConversationMemoryClient>().SaveSessionAsync(
                     new ConversationSession
                     {
                         ConversationId = payload.ConversationId,
                         CreatedAt = payload.CreatedAt,
                         LastMessageAt = payload.LastMessageAt,
-                        JourneyStage = stage,
+                        JourneyStage = payload.JourneyStage,
                         LastIntent = payload.LastIntent
                     },
                     cancellationToken);

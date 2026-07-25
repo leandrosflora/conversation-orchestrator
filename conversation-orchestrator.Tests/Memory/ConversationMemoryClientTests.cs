@@ -28,13 +28,16 @@ public class ConversationMemoryClientTests
         var session = await client.GetOrCreateSessionAsync("conv-1", CancellationToken.None);
 
         Assert.Equal("conv-1", session.ConversationId);
-        Assert.Equal(JourneyStage.EligibilityChecked, session.JourneyStage);
+        Assert.Equal("EligibilityChecked", session.JourneyStage);
         Assert.Equal("renegotiation_request", session.LastIntent);
     }
 
     [Fact]
-    public async Task GetOrCreateSessionAsync_UnparseableJourneyStage_FallsBackToStarted()
+    public async Task GetOrCreateSessionAsync_ArbitraryJourneyStage_PassedThroughVerbatim()
     {
+        // JourneyStage is an opaque, skill-defined string as far as the orchestrator is
+        // concerned - there's no fixed vocabulary to validate against, so any value the memory
+        // service returns is passed through as-is, not parsed or defaulted.
         var handler = new StubHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
         {
             Content = JsonContent("""
@@ -46,7 +49,7 @@ public class ConversationMemoryClientTests
         var session = await client.GetOrCreateSessionAsync("conv-1b", CancellationToken.None);
 
         Assert.Equal("conv-1b", session.ConversationId);
-        Assert.Equal(JourneyStage.Started, session.JourneyStage);
+        Assert.Equal("eligibility", session.JourneyStage);
     }
 
     [Fact]
@@ -58,7 +61,7 @@ public class ConversationMemoryClientTests
         var session = await client.GetOrCreateSessionAsync("conv-2", CancellationToken.None);
 
         Assert.Equal("conv-2", session.ConversationId);
-        Assert.Equal(JourneyStage.Started, session.JourneyStage);
+        Assert.Equal("Started", session.JourneyStage);
         Assert.Null(session.LastIntent);
     }
 
@@ -71,7 +74,7 @@ public class ConversationMemoryClientTests
         var session = await client.GetOrCreateSessionAsync("conv-3", CancellationToken.None);
 
         Assert.Equal("conv-3", session.ConversationId);
-        Assert.Equal(JourneyStage.Started, session.JourneyStage);
+        Assert.Equal("Started", session.JourneyStage);
     }
 
     [Fact]
@@ -91,7 +94,7 @@ public class ConversationMemoryClientTests
                 ConversationId = "conv-4",
                 CreatedAt = DateTimeOffset.UtcNow,
                 LastMessageAt = DateTimeOffset.UtcNow,
-                JourneyStage = JourneyStage.AgreementProcessing,
+                JourneyStage = "AgreementProcessing",
                 LastIntent = "faq"
             },
             CancellationToken.None);

@@ -1,7 +1,5 @@
 using System.Diagnostics;
-using System.Globalization;
-using System.Text;
-using System.Text.RegularExpressions;
+using System.Text.Json;
 using conversation_orchestrator.Application.Outbox;
 using conversation_orchestrator.Application.Ports.Inbound;
 using conversation_orchestrator.Application.Ports.Outbound;
@@ -10,13 +8,28 @@ using conversation_orchestrator.Platform;
 
 namespace conversation_orchestrator.Application.UseCases;
 
+/// <summary>
+/// Skill-agnostic: this use case has no compiled knowledge of any business domain's journey
+/// stages, triggers, or customer-text vocabulary. It resolves which skill's agent handles a
+/// conversation (agent-skill-registry), forwards the message, persists whatever opaque
+/// State/StructuredState that agent reports, and dispatches the same generic effects (reply,
+/// memory, audit, handoff) regardless of which skill produced them. See journey-state-machine
+/// for why: State's ordering/legality is no longer something the orchestrator can validate once
+/// it's skill-defined, so it trusts the resolved agent's verified-evidence-based reporting
+/// instead (the same standard agent-runtime-renegotiation already meets for its own State).
+/// </summary>
 public class IngestMessageUseCase(
     IMessageInboxStore inboxStore,
-    IAgentRuntimeClient agentRuntimeClient,
+    IAgentSkillRegistry agentSkillRegistry,
     TenantContext tenantContext,
     PlatformMetrics metrics,
     ILogger<IngestMessageUseCase> logger) : IIngestMessageUseCase
 {
+    /// <summary>The one state value the orchestrator owns itself, regardless of skill - see
+    /// journey-state-machine's "Handoff always transitions to the reserved HandoffRequested
+    /// state" requirement.</summary>
+    public const string HandoffRequestedState = "HandoffRequested";
+
     public async Task<IngestMessageResult> ExecuteAsync(
         InboundChannelMessage message,
         CancellationToken cancellationToken)
@@ -61,139 +74,89 @@ public class IngestMessageUseCase(
 
         try
         {
-            var previousStage = checkpoint.JourneyStage;
-            var confirmationMessageId = ExplicitConfirmationDetector.IsExplicitConfirmation(message, previousStage)
-                ? messageId
+            var previousState = checkpoint.State;
+            var skillId = checkpoint.SkillId ?? agentSkillRegistry.ResolveTenantSkill(tenantContext.TenantId);
+            var agentClient = skillId is not null ? agentSkillRegistry.Resolve(skillId) : null;
+
+            AgentRuntimeResult result;
+            // Not disposed: this is a short-lived, per-request value whose lifetime needs to
+            // outlast this method (the real AgentRuntimeClient serializes it during the awaited
+            // HTTP call below, but a caller inspecting the request object afterwards - as tests
+            // legitimately do - would otherwise see it torn down first). JsonDocument.Dispose()
+            // only returns pooled buffers early; skipping it just defers that to the GC.
+            var priorStructuredState = checkpoint.StructuredState is not null
+                ? JsonDocument.Parse(checkpoint.StructuredState)
                 : null;
 
-            var result = await agentRuntimeClient.ProcessAsync(
-                new AgentRuntimeRequest
+            if (agentClient is null)
+            {
+                // No skill assigned to this tenant, or the assigned/pinned skill id isn't (or is
+                // no longer) configured - can't call an agent that doesn't exist. Treat exactly
+                // like an unreachable Agent Runtime: require handoff, don't crash.
+                result = AgentRuntimeResult.SkillNotConfigured();
+                if (skillId is null)
                 {
-                    TenantId = tenantId.ToString("D"),
-                    ConversationId = conversationId,
-                    MessageId = messageId,
-                    MessageType = message.Type.ToString(),
-                    Text = message.Text ?? message.Interactive?.Title,
-                    JourneyStage = previousStage.ToString(),
-                    JourneyVersion = checkpoint.Version,
-                    LastIntent = checkpoint.LastIntent,
-                    ExplicitConfirmationMessageId = confirmationMessageId,
-                    ActiveContractId = checkpoint.ActiveContractId,
-                    ActiveSimulationId = checkpoint.ActiveSimulationId,
-                    ActiveAgreementId = checkpoint.ActiveAgreementId
-                },
-                cancellationToken);
+                    logger.LogWarning(
+                        "No skill assigned for tenant {TenantId}, conversation {ConversationId}",
+                        tenantId,
+                        conversationId);
+                }
+                else
+                {
+                    logger.LogWarning(
+                        "Skill {SkillId} is not configured, conversation {ConversationId}",
+                        skillId,
+                        conversationId);
+                }
+            }
+            else
+            {
+                result = await agentClient.ProcessAsync(
+                    new AgentRuntimeRequest
+                    {
+                        TenantId = tenantId.ToString("D"),
+                        ConversationId = conversationId,
+                        MessageId = messageId,
+                        MessageType = message.Type.ToString(),
+                        Text = message.Text ?? message.Interactive?.Title,
+                        // HandoffRequested is the one state this orchestrator owns itself (see
+                        // journey-state-machine) - it means nothing to the skill's own vocabulary,
+                        // and confirmed live it left the agent with no reason to attempt any tool
+                        // (every governed tool is stage-denied from it, so it just gave up). Since
+                        // we're calling the agent again anyway, that already means we're routing
+                        // back to it rather than a human - give it a clean slate instead of a state
+                        // it can't act on, so it has a real chance to make progress this turn.
+                        State = previousState == HandoffRequestedState ? null : previousState,
+                        JourneyVersion = checkpoint.Version,
+                        LastIntent = checkpoint.LastIntent,
+                        StructuredState = priorStructuredState
+                    },
+                    cancellationToken);
+            }
 
             metrics.Increment(
                 "orchestrator_agent_decisions_total",
                 ("outcome", ClassifyAgentOutcome(result)));
 
             var nextIntent = result.Intent ?? checkpoint.LastIntent;
-            // The Agent Runtime already echoes back the previous value when it has nothing new
-            // to report (see agent-runtime-renegotiation's core.py) - this fallback only matters
-            // for the AgentRuntimeResult.Unavailable() path, which has no way to know what the
-            // checkpoint held.
-            var nextActiveContractId = result.ActiveContractId ?? checkpoint.ActiveContractId;
-            var nextActiveSimulationId = result.ActiveSimulationId ?? checkpoint.ActiveSimulationId;
-            var nextActiveAgreementId = result.ActiveAgreementId ?? checkpoint.ActiveAgreementId;
-            var nextStage = previousStage;
-            if (result.RequiresHandoff)
-            {
-                nextStage = JourneyStage.HandoffRequested;
-            }
-            else
-            {
-                // JourneyMilestone is computed by agent-runtime-renegotiation from verified
-                // governed-tool outcomes (see journey-milestone-reporting), not from freeform
-                // Intent text - prefer it whenever present and it doesn't regress the stage.
-                // "Legal" here is deliberately just forward-or-equal in the enum's declaration
-                // order, not a (from, trigger) transition-table lookup: a milestone can validly
-                // jump several stages in one turn (e.g. Started -> ContractSelected when a
-                // single-contract customer identifies themselves and their contract in the same
-                // message), which the older trigger table - built for one hop per turn - doesn't
-                // model.
-                JourneyStage? milestoneStage = null;
-                if (!string.IsNullOrWhiteSpace(result.JourneyMilestone)
-                    && Enum.TryParse<JourneyStage>(result.JourneyMilestone, true, out var parsedMilestone)
-                    && (int)parsedMilestone >= (int)previousStage)
-                {
-                    milestoneStage = parsedMilestone;
-                }
+            // The resolved agent already echoes back the previous StructuredState when it has
+            // nothing new to report - this fallback only matters for a synthetic/unavailable
+            // result, which has no way to know what the checkpoint held.
+            var nextStructuredState = result.StructuredState is not null
+                ? result.StructuredState.RootElement.GetRawText()
+                : checkpoint.StructuredState;
+            var nextSkillId = skillId ?? checkpoint.SkillId;
+            var nextState = result.RequiresHandoff
+                ? HandoffRequestedState
+                : (result.State ?? previousState);
 
-                if (milestoneStage is not null)
-                {
-                    nextStage = milestoneStage.Value;
-                    metrics.Increment(
-                        "orchestrator_journey_transitions_total",
-                        ("from", previousStage.ToString()),
-                        ("to", nextStage.ToString()),
-                        ("outcome", "applied_milestone"));
-                }
-                else if (ProposalSelectionDetector.IsProposalSelection(message, previousStage))
-                {
-                    // Reads the customer's own raw text, not the Agent Runtime's Intent label -
-                    // see ProposalSelectionDetector's doc comment for why the Intent-based path
-                    // doesn't reliably catch this hop.
-                    nextStage = JourneyStage.ProposalSelected;
-                    metrics.Increment(
-                        "orchestrator_journey_transitions_total",
-                        ("from", previousStage.ToString()),
-                        ("to", nextStage.ToString()),
-                        ("outcome", "applied_customer_text"));
-                }
-                else
-                {
-                    var trigger = JourneyTriggerClassifier.Classify(result.Intent);
-                    if (JourneyStageTransitions.TryGetNext(previousStage, trigger, out var transitionedStage))
-                    {
-                        nextStage = transitionedStage;
-                        metrics.Increment(
-                            "orchestrator_journey_transitions_total",
-                            ("from", previousStage.ToString()),
-                            ("to", nextStage.ToString()),
-                            ("outcome", "applied"));
-                    }
-                    else if (trigger != JourneyTrigger.None)
-                    {
-                        metrics.Increment(
-                            "orchestrator_journey_transitions_total",
-                            ("from", previousStage.ToString()),
-                            ("to", previousStage.ToString()),
-                            ("outcome", "rejected"));
-                        metrics.Increment(
-                            "orchestrator_journey_triggers_total",
-                            ("trigger", trigger.ToString()),
-                            ("outcome", "rejected"));
-                        logger.LogInformation(
-                            "Rejected journey trigger {Trigger} from stage {Stage} for conversation {ConversationId}",
-                            trigger,
-                            previousStage,
-                            conversationId);
-                    }
-                }
-
-                // JourneyTriggerClassifier is keyword-based on the model's freeform Intent, which
-                // doesn't always name a trigger matching what actually happened (e.g. Intent
-                // comes back as a tool name like "consultar_debitos" rather than something
-                // classifying as ProvidedIdentification/SelectedContract) - confirmed live: a
-                // real conversation got permanently stuck at IdentificationPending this way, with
-                // ActiveContractId already populated proving identification and contract lookup
-                // had genuinely succeeded. ActiveContractId newly appearing is unambiguous
-                // structural proof of that progress, independent of how the model phrased its
-                // intent - use it as a fallback so the stage doesn't wait forever for a keyword
-                // match that may never come.
-                if (nextStage == previousStage
-                    && nextActiveContractId is not null
-                    && checkpoint.ActiveContractId is null
-                    && previousStage is JourneyStage.Started or JourneyStage.IdentificationPending or JourneyStage.CustomerIdentified)
-                {
-                    nextStage = JourneyStage.ContractSelected;
-                    metrics.Increment(
-                        "orchestrator_journey_transitions_total",
-                        ("from", previousStage.ToString()),
-                        ("to", nextStage.ToString()),
-                        ("outcome", "applied_structural_fallback"));
-                }
+            if (!result.RequiresHandoff && nextState != previousState)
+            {
+                metrics.Increment(
+                    "orchestrator_journey_transitions_total",
+                    ("from", previousState),
+                    ("to", nextState),
+                    ("outcome", "applied"));
             }
 
             var now = DateTimeOffset.UtcNow;
@@ -202,8 +165,8 @@ public class IngestMessageUseCase(
                 tenantId,
                 message,
                 checkpoint,
-                previousStage,
-                nextStage,
+                previousState,
+                nextState,
                 nextIntent,
                 result,
                 outcome,
@@ -215,13 +178,12 @@ public class IngestMessageUseCase(
                     messageId,
                     conversationId,
                     message.ReceivedAt,
-                    nextStage,
+                    nextState,
                     nextIntent,
                     checkpoint.Version,
                     effects,
-                    nextActiveContractId,
-                    nextActiveSimulationId,
-                    nextActiveAgreementId),
+                    nextSkillId,
+                    nextStructuredState),
                 cancellationToken);
 
             metrics.Increment("orchestrator_journey_outcomes_total", ("outcome", outcome));
@@ -262,8 +224,8 @@ public class IngestMessageUseCase(
         Guid tenantId,
         InboundChannelMessage message,
         ConversationCheckpoint checkpoint,
-        JourneyStage previousStage,
-        JourneyStage nextStage,
+        string previousState,
+        string nextState,
         string? nextIntent,
         AgentRuntimeResult result,
         string outcome,
@@ -289,7 +251,7 @@ public class IngestMessageUseCase(
                     conversationId,
                     checkpoint.LastReceivedAt ?? message.ReceivedAt,
                     message.ReceivedAt,
-                    nextStage.ToString(),
+                    nextState,
                     nextIntent)),
             DurableEffectFactory.Create(
                 OutboxEffectTypes.AuditRecord,
@@ -313,15 +275,15 @@ public class IngestMessageUseCase(
                     now)));
         }
 
-        if (nextStage != previousStage)
+        if (nextState != previousState)
         {
             effects.Add(DurableEffectFactory.Create(
                 OutboxEffectTypes.StateChanged,
                 $"state:{keyPrefix}",
                 new StateChangedEffect(
                     conversationId,
-                    previousStage.ToString(),
-                    nextStage.ToString(),
+                    previousState,
+                    nextState,
                     now)));
         }
 
@@ -373,94 +335,11 @@ public class IngestMessageUseCase(
 
     private static string ClassifyAgentOutcome(AgentRuntimeResult result)
     {
-        if (result.HandoffReason == AgentRuntimeResult.AgentRuntimeUnavailableReason)
+        if (result.HandoffReason == AgentRuntimeResult.AgentRuntimeUnavailableReason
+            || result.HandoffReason == AgentRuntimeResult.SkillNotConfiguredReason)
         {
             return "unavailable";
         }
         return result.RequiresHandoff ? "handoff" : "automatic";
-    }
-}
-
-internal static class PortugueseTextNormalizer
-{
-    public static string RemoveDiacritics(string value)
-    {
-        var normalized = value.Normalize(NormalizationForm.FormD);
-        var builder = new StringBuilder(normalized.Length);
-        foreach (var character in normalized)
-        {
-            if (CharUnicodeInfo.GetUnicodeCategory(character) != UnicodeCategory.NonSpacingMark)
-            {
-                builder.Append(character);
-            }
-        }
-        return builder.ToString().Normalize(NormalizationForm.FormC);
-    }
-}
-
-internal static class ExplicitConfirmationDetector
-{
-    private static readonly Regex PositiveConfirmation = new(
-        @"\b(confirmo|aceito|pode confirmar|pode fechar|fechar acordo|quero fechar|sim confirmo|sim aceito)\b",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
-
-    public static bool IsExplicitConfirmation(InboundChannelMessage message, JourneyStage stage)
-    {
-        if (stage is not (JourneyStage.ProposalSelected or JourneyStage.ConfirmationPending))
-        {
-            return false;
-        }
-
-        var value = message.Interactive?.Title ?? message.Text;
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return false;
-        }
-
-        var normalized = PortugueseTextNormalizer.RemoveDiacritics(value).ToLowerInvariant();
-        if (Regex.IsMatch(normalized, @"\b(nao|nunca|cancel|desist)\b"))
-        {
-            return false;
-        }
-        return PositiveConfirmation.IsMatch(normalized);
-    }
-}
-
-/// <summary>
-/// Design decision 5 (stabilize-renegotiation-journey-progression): ProposalAvailable ->
-/// ProposalSelected is fundamentally about what the *customer* decided, not a governed-tool
-/// outcome - there's no MCP tool call for "customer picked this proposal". JourneyTriggerClassifier
-/// classifies the Agent Runtime's own Intent, not the customer's words - confirmed live this
-/// mismatches: a customer message "Aceito essa proposta" produced Intent
-/// "confirm_agreement_request", which classifies as ConfirmedAgreement (needs ProposalSelected
-/// already) rather than SelectedProposal, so the transition table found no legal entry from
-/// ProposalAvailable and the stage never moved. Reads the customer's own raw message instead,
-/// mirroring ExplicitConfirmationDetector.
-/// </summary>
-internal static class ProposalSelectionDetector
-{
-    private static readonly Regex PositiveSelection = new(
-        @"\b(aceito|aceita|escolho|essa mesma|essa proposta|fechar essa|quero essa|pode ser essa|gostei dessa)\b",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
-
-    public static bool IsProposalSelection(InboundChannelMessage message, JourneyStage stage)
-    {
-        if (stage != JourneyStage.ProposalAvailable)
-        {
-            return false;
-        }
-
-        var value = message.Interactive?.Title ?? message.Text;
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return false;
-        }
-
-        var normalized = PortugueseTextNormalizer.RemoveDiacritics(value).ToLowerInvariant();
-        if (Regex.IsMatch(normalized, @"\b(nao|nunca|cancel|desist)\b"))
-        {
-            return false;
-        }
-        return PositiveSelection.IsMatch(normalized);
     }
 }

@@ -18,6 +18,8 @@ namespace conversation_orchestrator.Tests.Messages;
 
 public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactory<Program>>
 {
+    private const string TestSkillId = "test-skill";
+
     private readonly WebApplicationFactory<Program> _baseFactory;
 
     public MessageIngestionEndpointsTests(WebApplicationFactory<Program> factory)
@@ -206,14 +208,16 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
     }
 
     [Fact]
-    public async Task PostMessages_PersistsActiveRenegotiationStateAcrossTurns()
+    public async Task PostMessages_PersistsStructuredStateAcrossTurns()
     {
-        // agent-runtime-renegotiation can't recover a simulation_id from chat history alone (it's
-        // never spoken to the customer), so the Orchestrator round-trips ActiveContractId/
-        // ActiveSimulationId/ActiveAgreementId through ConversationCheckpoint <-> AgentRuntimeRequest
-        // the same way it already does for JourneyStage/LastIntent. This is what lets a later turn
-        // (e.g. confirmar_acordo) reference a simulation created in an earlier one.
+        // agent-runtime-renegotiation (or any skill's agent) can't recover domain-specific
+        // identifiers (e.g. a simulation_id) from chat history alone - they're never spoken to
+        // the customer. The Orchestrator round-trips the opaque StructuredState JSON blob through
+        // ConversationCheckpoint <-> AgentRuntimeRequest the same way it already does for
+        // State/LastIntent, without ever inspecting its contents - see agent-runtime-orchestration's
+        // "Structured state is round-tripped opaquely" requirement.
         var agentRuntime = new Mock<IAgentRuntimeClient>();
+        using var firstStructuredState = JsonDocument.Parse("""{"contract_id":"contract-1","simulation_id":"sim-1"}""");
         agentRuntime
             .SetupSequence(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new AgentRuntimeResult
@@ -221,8 +225,8 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
                 Intent = "simular_proposta",
                 ReplyText = "Simulei uma proposta para voce.",
                 RequiresHandoff = false,
-                ActiveContractId = "contract-1",
-                ActiveSimulationId = "sim-1"
+                State = "ProposalAvailable",
+                StructuredState = firstStructuredState
             })
             .ReturnsAsync(new AgentRuntimeResult
             {
@@ -255,8 +259,9 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
             a => a.ProcessAsync(
                 It.Is<AgentRuntimeRequest>(r =>
                     r.MessageId == "wamid.state-2"
-                    && r.ActiveContractId == "contract-1"
-                    && r.ActiveSimulationId == "sim-1"),
+                    && r.StructuredState != null
+                    && r.StructuredState.RootElement.GetProperty("contract_id").GetString() == "contract-1"
+                    && r.StructuredState.RootElement.GetProperty("simulation_id").GetString() == "sim-1"),
                 It.IsAny<CancellationToken>()),
             Times.Once);
     }
@@ -319,12 +324,22 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
     }
 
     [Fact]
-    public async Task PostMessages_IntentClassifiesToLegalTrigger_SavesExpectedNextJourneyStage()
+    public async Task PostMessages_AgentReportedState_AdvancesJourneyState()
     {
+        // State is opaque and skill-defined - the orchestrator persists whatever the resolved
+        // agent reports, without interpreting Intent or validating legality/ordering. See
+        // journey-state-machine's "JourneyState is an opaque string reported by the resolved
+        // skill's agent" requirement.
         var agentRuntime = new Mock<IAgentRuntimeClient>();
         agentRuntime
             .Setup(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new AgentRuntimeResult { Intent = "selecionar_contrato", ReplyText = "Ok!", RequiresHandoff = false });
+            .ReturnsAsync(new AgentRuntimeResult
+            {
+                Intent = "consultar_debitos",
+                ReplyText = "Identifiquei seus dois contratos.",
+                RequiresHandoff = false,
+                State = "ContractSelectionPending"
+            });
         ConversationSession? saved = null;
         var memoryClient = new Mock<IConversationMemoryClient>();
         memoryClient
@@ -334,7 +349,7 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
                 ConversationId = conversationId,
                 CreatedAt = DateTimeOffset.UtcNow,
                 LastMessageAt = DateTimeOffset.UtcNow,
-                JourneyStage = JourneyStage.CustomerIdentified
+                JourneyStage = "IdentificationPending"
             });
         memoryClient
             .Setup(c => c.SaveSessionAsync(It.IsAny<ConversationSession>(), It.IsAny<CancellationToken>()))
@@ -344,25 +359,25 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
             agentRuntime.Object,
             conversationMemoryClient: memoryClient.Object,
             seedConversationId: "5511999990000",
-            seedJourneyStage: JourneyStage.CustomerIdentified);
+            seedState: "IdentificationPending");
 
         var response = await client.PostAsJsonAsync("/messages", new
         {
-            MessageId = "wamid.stage-1",
+            MessageId = "wamid.state-advance-1",
             From = "5511999990000",
             ConversationId = "5511999990000",
             Type = 0,
-            Text = "Quero o contrato 123",
+            Text = "Meu CPF e 22222222222",
             ReceivedAt = DateTimeOffset.UtcNow
         });
 
         Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
         Assert.NotNull(saved);
-        Assert.Equal(JourneyStage.ContractSelected, saved!.JourneyStage);
+        Assert.Equal("ContractSelectionPending", saved!.JourneyStage);
     }
 
     [Fact]
-    public async Task PostMessages_UnrecognizedIntent_LeavesJourneyStageUnchanged()
+    public async Task PostMessages_AbsentState_LeavesJourneyStateUnchanged()
     {
         var agentRuntime = new Mock<IAgentRuntimeClient>();
         agentRuntime
@@ -377,7 +392,7 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
                 ConversationId = conversationId,
                 CreatedAt = DateTimeOffset.UtcNow,
                 LastMessageAt = DateTimeOffset.UtcNow,
-                JourneyStage = JourneyStage.CustomerIdentified
+                JourneyStage = "CustomerIdentified"
             });
         memoryClient
             .Setup(c => c.SaveSessionAsync(It.IsAny<ConversationSession>(), It.IsAny<CancellationToken>()))
@@ -387,11 +402,11 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
             agentRuntime.Object,
             conversationMemoryClient: memoryClient.Object,
             seedConversationId: "5511999990000",
-            seedJourneyStage: JourneyStage.CustomerIdentified);
+            seedState: "CustomerIdentified");
 
         var response = await client.PostAsJsonAsync("/messages", new
         {
-            MessageId = "wamid.stage-2",
+            MessageId = "wamid.state-unchanged-1",
             From = "5511999990000",
             ConversationId = "5511999990000",
             Type = 0,
@@ -401,65 +416,52 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
 
         Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
         Assert.NotNull(saved);
-        Assert.Equal(JourneyStage.CustomerIdentified, saved!.JourneyStage);
+        Assert.Equal("CustomerIdentified", saved!.JourneyStage);
     }
 
     [Fact]
-    public async Task PostMessages_NewActiveContractIdAdvancesStageEvenWithUnrecognizedIntent()
+    public async Task PostMessages_FromHandoffRequested_SendsNullStateSoTheAgentGetsAFreshStart()
     {
-        // Reproduces a real stuck conversation: the model reported Intent="consultar_debitos" (a
-        // tool name, not a trigger keyword JourneyTriggerClassifier recognizes) while also
-        // reporting ActiveContractId for the first time - proof identification/contract lookup
-        // had genuinely succeeded this turn. Without the structural fallback, the stage would sit
-        // at IdentificationPending forever since no trigger ever classifies from that intent.
+        // Regression test: HandoffRequested is the one state the orchestrator owns itself:
+        // the resolved skill's agent has no vocabulary for it, and confirmed live it left the
+        // agent with no reason to attempt any tool (every governed tool is stage-denied from a
+        // state it doesn't recognize), so a customer's follow-up message just got the same
+        // canned handoff reply forever with no way back. Calling the agent at all already means
+        // we're routing back to it, not a human, so it should see a clean slate.
+        AgentRuntimeRequest? captured = null;
         var agentRuntime = new Mock<IAgentRuntimeClient>();
         agentRuntime
             .Setup(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
+            .Callback<AgentRuntimeRequest, CancellationToken>((request, _) => captured = request)
             .ReturnsAsync(new AgentRuntimeResult
             {
-                Intent = "consultar_debitos",
-                ReplyText = "Ja confirmei seu contrato.",
+                Intent = "identificacao_cliente",
+                ReplyText = "Identifiquei seu cadastro.",
                 RequiresHandoff = false,
-                ActiveContractId = "11111111111-contract-1"
+                State = "CustomerIdentified"
             });
-        ConversationSession? saved = null;
-        var memoryClient = new Mock<IConversationMemoryClient>();
-        memoryClient
-            .Setup(c => c.GetOrCreateSessionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync((string conversationId, CancellationToken _) => new ConversationSession
-            {
-                ConversationId = conversationId,
-                CreatedAt = DateTimeOffset.UtcNow,
-                LastMessageAt = DateTimeOffset.UtcNow,
-                JourneyStage = JourneyStage.IdentificationPending
-            });
-        memoryClient
-            .Setup(c => c.SaveSessionAsync(It.IsAny<ConversationSession>(), It.IsAny<CancellationToken>()))
-            .Callback<ConversationSession, CancellationToken>((session, _) => saved = session)
-            .Returns(Task.CompletedTask);
         var client = CreateClient(
             agentRuntime.Object,
-            conversationMemoryClient: memoryClient.Object,
             seedConversationId: "5511999990000",
-            seedJourneyStage: JourneyStage.IdentificationPending);
+            seedState: "HandoffRequested");
 
         var response = await client.PostAsJsonAsync("/messages", new
         {
-            MessageId = "wamid.stage-3",
+            MessageId = "wamid.handoff-recovery-1",
             From = "5511999990000",
             ConversationId = "5511999990000",
             Type = 0,
-            Text = "Meu CPF e 11111111111",
+            Text = "oi, meu CPF e 11111111111",
             ReceivedAt = DateTimeOffset.UtcNow
         });
 
         Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
-        Assert.NotNull(saved);
-        Assert.Equal(JourneyStage.ContractSelected, saved!.JourneyStage);
+        Assert.NotNull(captured);
+        Assert.Null(captured!.State);
     }
 
     [Fact]
-    public async Task PostMessages_RequiresHandoff_OverridesOtherwiseLegalTransition()
+    public async Task PostMessages_RequiresHandoff_OverridesSkillReportedState()
     {
         var agentRuntime = new Mock<IAgentRuntimeClient>();
         agentRuntime
@@ -468,7 +470,8 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
             {
                 Intent = "selecionar_contrato",
                 RequiresHandoff = true,
-                HandoffReason = "low_confidence"
+                HandoffReason = "low_confidence",
+                State = "ContractSelected"
             });
         ConversationSession? saved = null;
         var memoryClient = new Mock<IConversationMemoryClient>();
@@ -479,7 +482,7 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
                 ConversationId = conversationId,
                 CreatedAt = DateTimeOffset.UtcNow,
                 LastMessageAt = DateTimeOffset.UtcNow,
-                JourneyStage = JourneyStage.CustomerIdentified
+                JourneyStage = "CustomerIdentified"
             });
         memoryClient
             .Setup(c => c.SaveSessionAsync(It.IsAny<ConversationSession>(), It.IsAny<CancellationToken>()))
@@ -493,11 +496,11 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
             auditClient: audit.Object,
             conversationMemoryClient: memoryClient.Object,
             seedConversationId: "5511999990000",
-            seedJourneyStage: JourneyStage.CustomerIdentified);
+            seedState: "CustomerIdentified");
 
         var response = await client.PostAsJsonAsync("/messages", new
         {
-            MessageId = "wamid.stage-3",
+            MessageId = "wamid.state-handoff-1",
             From = "5511999990000",
             ConversationId = "5511999990000",
             Type = 0,
@@ -507,255 +510,40 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
 
         Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
         Assert.NotNull(saved);
-        Assert.Equal(JourneyStage.HandoffRequested, saved!.JourneyStage);
+        // The agent's own reported State (ContractSelected) is discarded in favor of the reserved
+        // HandoffRequested value - handoff is the one thing the orchestrator still owns itself.
+        Assert.Equal("HandoffRequested", saved!.JourneyStage);
     }
 
     [Fact]
-    public async Task PostMessages_JourneyMilestone_AdvancesDirectlyIgnoringUnrecognizedIntent()
+    public async Task PostMessages_NoSkillConfiguredForTenant_RequestsHandoffWithoutThrowing()
     {
-        // JourneyMilestone comes from verified tool outcomes (agent-runtime-renegotiation), not
-        // freeform Intent text - it should drive the stage even when Intent classifies to nothing.
+        // See agent-skill-registry's "Unassigned tenant is treated as handoff-worthy" requirement.
         var agentRuntime = new Mock<IAgentRuntimeClient>();
-        agentRuntime
-            .Setup(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new AgentRuntimeResult
-            {
-                Intent = "consultar_debitos",
-                ReplyText = "Identifiquei seus dois contratos.",
-                RequiresHandoff = false,
-                JourneyMilestone = "ContractSelectionPending"
-            });
-        ConversationSession? saved = null;
-        var memoryClient = new Mock<IConversationMemoryClient>();
-        memoryClient
-            .Setup(c => c.GetOrCreateSessionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync((string conversationId, CancellationToken _) => new ConversationSession
-            {
-                ConversationId = conversationId,
-                CreatedAt = DateTimeOffset.UtcNow,
-                LastMessageAt = DateTimeOffset.UtcNow,
-                JourneyStage = JourneyStage.IdentificationPending
-            });
-        memoryClient
-            .Setup(c => c.SaveSessionAsync(It.IsAny<ConversationSession>(), It.IsAny<CancellationToken>()))
-            .Callback<ConversationSession, CancellationToken>((session, _) => saved = session)
-            .Returns(Task.CompletedTask);
+        var handoff = new Mock<IHandoffServiceClient>();
         var client = CreateClient(
             agentRuntime.Object,
-            conversationMemoryClient: memoryClient.Object,
-            seedConversationId: "5511999990000",
-            seedJourneyStage: JourneyStage.IdentificationPending);
+            handoffClient: handoff.Object,
+            skillRegistry: new StubAgentSkillRegistry(client: null, tenantSkillId: null));
 
         var response = await client.PostAsJsonAsync("/messages", new
         {
-            MessageId = "wamid.milestone-1",
+            MessageId = "wamid.no-skill-1",
             From = "5511999990000",
             ConversationId = "5511999990000",
             Type = 0,
-            Text = "Meu CPF e 22222222222",
+            Text = "Ola",
             ReceivedAt = DateTimeOffset.UtcNow
         });
 
         Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
-        Assert.NotNull(saved);
-        Assert.Equal(JourneyStage.ContractSelectionPending, saved!.JourneyStage);
-    }
-
-    [Fact]
-    public async Task PostMessages_JourneyMilestone_RegressiveMilestoneFallsBackToIntentClassification()
-    {
-        var agentRuntime = new Mock<IAgentRuntimeClient>();
-        agentRuntime
-            .Setup(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new AgentRuntimeResult
-            {
-                Intent = "aceito essa proposta",
-                ReplyText = "Combinado!",
-                RequiresHandoff = false,
-                JourneyMilestone = "CustomerIdentified"
-            });
-        ConversationSession? saved = null;
-        var memoryClient = new Mock<IConversationMemoryClient>();
-        memoryClient
-            .Setup(c => c.GetOrCreateSessionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync((string conversationId, CancellationToken _) => new ConversationSession
-            {
-                ConversationId = conversationId,
-                CreatedAt = DateTimeOffset.UtcNow,
-                LastMessageAt = DateTimeOffset.UtcNow,
-                JourneyStage = JourneyStage.ProposalAvailable
-            });
-        memoryClient
-            .Setup(c => c.SaveSessionAsync(It.IsAny<ConversationSession>(), It.IsAny<CancellationToken>()))
-            .Callback<ConversationSession, CancellationToken>((session, _) => saved = session)
-            .Returns(Task.CompletedTask);
-        var client = CreateClient(
-            agentRuntime.Object,
-            conversationMemoryClient: memoryClient.Object,
-            seedConversationId: "5511999990000",
-            seedJourneyStage: JourneyStage.ProposalAvailable);
-
-        var response = await client.PostAsJsonAsync("/messages", new
-        {
-            MessageId = "wamid.milestone-2",
-            From = "5511999990000",
-            ConversationId = "5511999990000",
-            Type = 0,
-            Text = "Aceito essa proposta",
-            ReceivedAt = DateTimeOffset.UtcNow
-        });
-
-        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
-        Assert.NotNull(saved);
-        // The stale/regressive milestone (CustomerIdentified) is ignored; the legal
-        // ProposalAvailable -> ProposalSelected transition from Intent classification wins instead.
-        Assert.Equal(JourneyStage.ProposalSelected, saved!.JourneyStage);
-    }
-
-    [Fact]
-    public async Task PostMessages_JourneyMilestone_HandoffOverridesAnOtherwiseLegalMilestone()
-    {
-        var agentRuntime = new Mock<IAgentRuntimeClient>();
-        agentRuntime
-            .Setup(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new AgentRuntimeResult
-            {
-                Intent = "consultar_cliente",
-                RequiresHandoff = true,
-                HandoffReason = "low_confidence",
-                JourneyMilestone = "ContractSelected"
-            });
-        ConversationSession? saved = null;
-        var memoryClient = new Mock<IConversationMemoryClient>();
-        memoryClient
-            .Setup(c => c.GetOrCreateSessionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync((string conversationId, CancellationToken _) => new ConversationSession
-            {
-                ConversationId = conversationId,
-                CreatedAt = DateTimeOffset.UtcNow,
-                LastMessageAt = DateTimeOffset.UtcNow,
-                JourneyStage = JourneyStage.IdentificationPending
-            });
-        memoryClient
-            .Setup(c => c.SaveSessionAsync(It.IsAny<ConversationSession>(), It.IsAny<CancellationToken>()))
-            .Callback<ConversationSession, CancellationToken>((session, _) => saved = session)
-            .Returns(Task.CompletedTask);
-        var client = CreateClient(
-            agentRuntime.Object,
-            conversationMemoryClient: memoryClient.Object,
-            seedConversationId: "5511999990000",
-            seedJourneyStage: JourneyStage.IdentificationPending);
-
-        var response = await client.PostAsJsonAsync("/messages", new
-        {
-            MessageId = "wamid.milestone-3",
-            From = "5511999990000",
-            ConversationId = "5511999990000",
-            Type = 0,
-            Text = "Meu CPF e 11111111111",
-            ReceivedAt = DateTimeOffset.UtcNow
-        });
-
-        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
-        Assert.NotNull(saved);
-        Assert.Equal(JourneyStage.HandoffRequested, saved!.JourneyStage);
-    }
-
-    [Fact]
-    public async Task PostMessages_CustomerAcceptsProposalInRawText_AdvancesToProposalSelected()
-    {
-        // Reproduces a real stuck conversation: the customer said "Aceito essa proposta", but the
-        // Agent Runtime's own Intent came back as "confirm_agreement_request" - which
-        // JourneyTriggerClassifier classifies as ConfirmedAgreement (needs ProposalSelected
-        // already), not SelectedProposal, so the trigger table found no legal transition from
-        // ProposalAvailable and the stage never moved. ProposalSelectionDetector reads the
-        // customer's own message instead of the agent's paraphrase.
-        var agentRuntime = new Mock<IAgentRuntimeClient>();
-        agentRuntime
-            .Setup(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new AgentRuntimeResult
-            {
-                Intent = "confirm_agreement_request",
-                ReplyText = "Nao consigo confirmar ainda.",
-                RequiresHandoff = false
-            });
-        ConversationSession? saved = null;
-        var memoryClient = new Mock<IConversationMemoryClient>();
-        memoryClient
-            .Setup(c => c.GetOrCreateSessionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync((string conversationId, CancellationToken _) => new ConversationSession
-            {
-                ConversationId = conversationId,
-                CreatedAt = DateTimeOffset.UtcNow,
-                LastMessageAt = DateTimeOffset.UtcNow,
-                JourneyStage = JourneyStage.ProposalAvailable
-            });
-        memoryClient
-            .Setup(c => c.SaveSessionAsync(It.IsAny<ConversationSession>(), It.IsAny<CancellationToken>()))
-            .Callback<ConversationSession, CancellationToken>((session, _) => saved = session)
-            .Returns(Task.CompletedTask);
-        var client = CreateClient(
-            agentRuntime.Object,
-            conversationMemoryClient: memoryClient.Object,
-            seedConversationId: "5511999990000",
-            seedJourneyStage: JourneyStage.ProposalAvailable);
-
-        var response = await client.PostAsJsonAsync("/messages", new
-        {
-            MessageId = "wamid.proposal-select-1",
-            From = "5511999990000",
-            ConversationId = "5511999990000",
-            Type = 0,
-            Text = "Aceito essa proposta",
-            ReceivedAt = DateTimeOffset.UtcNow
-        });
-
-        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
-        Assert.NotNull(saved);
-        Assert.Equal(JourneyStage.ProposalSelected, saved!.JourneyStage);
-    }
-
-    [Fact]
-    public async Task PostMessages_CustomerAsksQuestionAtProposalAvailable_StageUnchanged()
-    {
-        var agentRuntime = new Mock<IAgentRuntimeClient>();
-        agentRuntime
-            .Setup(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new AgentRuntimeResult { Intent = "faq", ReplyText = "Claro!", RequiresHandoff = false });
-        ConversationSession? saved = null;
-        var memoryClient = new Mock<IConversationMemoryClient>();
-        memoryClient
-            .Setup(c => c.GetOrCreateSessionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync((string conversationId, CancellationToken _) => new ConversationSession
-            {
-                ConversationId = conversationId,
-                CreatedAt = DateTimeOffset.UtcNow,
-                LastMessageAt = DateTimeOffset.UtcNow,
-                JourneyStage = JourneyStage.ProposalAvailable
-            });
-        memoryClient
-            .Setup(c => c.SaveSessionAsync(It.IsAny<ConversationSession>(), It.IsAny<CancellationToken>()))
-            .Callback<ConversationSession, CancellationToken>((session, _) => saved = session)
-            .Returns(Task.CompletedTask);
-        var client = CreateClient(
-            agentRuntime.Object,
-            conversationMemoryClient: memoryClient.Object,
-            seedConversationId: "5511999990000",
-            seedJourneyStage: JourneyStage.ProposalAvailable);
-
-        var response = await client.PostAsJsonAsync("/messages", new
-        {
-            MessageId = "wamid.proposal-select-2",
-            From = "5511999990000",
-            ConversationId = "5511999990000",
-            Type = 0,
-            Text = "Quanto fica o total se eu pagar em 6 vezes?",
-            ReceivedAt = DateTimeOffset.UtcNow
-        });
-
-        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
-        Assert.NotNull(saved);
-        Assert.Equal(JourneyStage.ProposalAvailable, saved!.JourneyStage);
+        agentRuntime.Verify(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+        handoff.Verify(
+            h => h.RequestHandoffAsync(
+                It.Is<HandoffRequest>(r => r.Reason == AgentRuntimeResult.SkillNotConfiguredReason),
+                It.IsAny<string>(),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
     }
 
     private HttpClient CreateClient(
@@ -766,22 +554,24 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
         IAuditServiceClient? auditClient = null,
         IConversationMemoryClient? conversationMemoryClient = null,
         IMessageInboxStore? inboxStore = null,
+        IAgentSkillRegistry? skillRegistry = null,
         string? seedConversationId = null,
-        JourneyStage? seedJourneyStage = null)
+        string? seedState = null)
     {
         var reply = replyClient ?? Mock.Of<IChannelReplyClient>();
         var events = eventPublisher ?? Mock.Of<IConversationEventPublisher>();
         var handoff = handoffClient ?? Mock.Of<IHandoffServiceClient>();
         var audit = auditClient ?? Mock.Of<IAuditServiceClient>();
         var memory = conversationMemoryClient ?? CreateDefaultConversationMemoryClient();
+        var registry = skillRegistry ?? new StubAgentSkillRegistry(agentRuntimeClient, TestSkillId);
 
         var factory = _baseFactory.WithWebHostBuilder(builder =>
         {
             TestAuth.ConfigureSigningKey(builder);
             builder.ConfigureTestServices(services =>
             {
-                services.RemoveAll<IAgentRuntimeClient>();
-                services.AddSingleton(agentRuntimeClient);
+                services.RemoveAll<IAgentSkillRegistry>();
+                services.AddSingleton(registry);
 
                 services.RemoveAll<IChannelReplyClient>();
                 services.AddSingleton(reply);
@@ -800,7 +590,7 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
 
                 services.RemoveAll<IMessageInboxStore>();
                 services.AddSingleton(inboxStore ?? new InMemoryMessageInboxStore(
-                    reply, events, handoff, audit, memory, seedConversationId, seedJourneyStage));
+                    reply, events, handoff, audit, memory, seedConversationId, seedState));
             });
         });
 
@@ -808,6 +598,16 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
         client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestAuth.IssueToken());
         client.DefaultRequestHeaders.Add("X-Tenant-Id", TestAuth.TenantId);
         return client;
+    }
+
+    /// <summary>Resolves every tenant to the same fixed skill id/client - this test suite only
+    /// ever exercises one skill at a time, so a full multi-skill registry stub isn't needed (see
+    /// AgentSkillRegistryTests for coverage of the real AgentSkillRegistry's resolution logic
+    /// itself). Pass client: null to simulate an unconfigured skill.</summary>
+    private sealed class StubAgentSkillRegistry(IAgentRuntimeClient? client, string? tenantSkillId) : IAgentSkillRegistry
+    {
+        public string? ResolveTenantSkill(string tenantId) => tenantSkillId;
+        public IAgentRuntimeClient? Resolve(string skillId) => client;
     }
 
     /// <summary>Minimal in-memory stand-in for PostgresMessageInboxStore + OutboxDispatcherService,
@@ -826,13 +626,13 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
         IAuditServiceClient auditClient,
         IConversationMemoryClient memoryClient,
         string? seedConversationId = null,
-        JourneyStage? seedJourneyStage = null) : IMessageInboxStore
+        string? seedState = null) : IMessageInboxStore
     {
         private readonly HashSet<string> _completed = new();
         private readonly HashSet<string> _inProgress = new();
         private readonly Dictionary<string, ConversationCheckpoint> _checkpoints =
-            seedConversationId is not null && seedJourneyStage is not null
-                ? new() { [seedConversationId] = new ConversationCheckpoint(seedJourneyStage.Value, null, 0, null, null) }
+            seedConversationId is not null && seedState is not null
+                ? new() { [seedConversationId] = new ConversationCheckpoint(seedState, null, 0, null, null) }
                 : new();
 
         public Task<InboxLease> TryAcquireAsync(
@@ -854,7 +654,7 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
 
             var checkpoint = _checkpoints.TryGetValue(conversationId, out var existing)
                 ? existing
-                : new ConversationCheckpoint(JourneyStage.Started, null, 0, null, null);
+                : new ConversationCheckpoint(ConversationCheckpoint.StartedState, null, 0, null, null);
             return Task.FromResult(new InboxLease(InboxAcquireResult.Acquired, checkpoint));
         }
 
@@ -863,14 +663,13 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
             _inProgress.Remove(command.MessageId);
             _completed.Add(command.MessageId);
             _checkpoints[command.ConversationId] = new ConversationCheckpoint(
-                command.JourneyStage,
+                command.State,
                 command.LastIntent,
                 command.ExpectedVersion + 1,
                 command.ReceivedAt,
                 command.MessageId,
-                command.ActiveContractId,
-                command.ActiveSimulationId,
-                command.ActiveAgreementId);
+                command.SkillId,
+                command.StructuredState);
 
             foreach (var effect in command.Effects)
             {
@@ -903,16 +702,13 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
                 case OutboxEffectTypes.MemorySaveSession:
                 {
                     var payload = Deserialize<MemorySaveSessionEffect>(effect.Payload);
-                    var stage = Enum.TryParse<JourneyStage>(payload.JourneyStage, true, out var parsed)
-                        ? parsed
-                        : JourneyStage.Started;
                     await memoryClient.SaveSessionAsync(
                         new ConversationSession
                         {
                             ConversationId = payload.ConversationId,
                             CreatedAt = payload.CreatedAt,
                             LastMessageAt = payload.LastMessageAt,
-                            JourneyStage = stage,
+                            JourneyStage = payload.JourneyStage,
                             LastIntent = payload.LastIntent
                         },
                         cancellationToken);
