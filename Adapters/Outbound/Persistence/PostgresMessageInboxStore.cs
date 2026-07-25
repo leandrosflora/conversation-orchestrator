@@ -82,9 +82,9 @@ public sealed class PostgresMessageInboxStore(
 
         const string ensureStateSql = """
             INSERT INTO ops.conversation_state
-                (tenant_id, conversation_id, journey_stage, version, created_at, updated_at)
+                (tenant_id, conversation_id, journey_stage, version, session_started_at, created_at, updated_at)
             VALUES
-                (@tenant_id, @conversation_id, @journey_stage, 0, now(), now())
+                (@tenant_id, @conversation_id, @journey_stage, 0, now(), now(), now())
             ON CONFLICT (tenant_id, conversation_id) DO NOTHING;
             """;
         await using (var ensureState = new NpgsqlCommand(ensureStateSql, connection, transaction))
@@ -104,7 +104,7 @@ public sealed class PostgresMessageInboxStore(
               AND conversation_id = @conversation_id
               AND (processing_lease_until IS NULL OR processing_lease_until < now())
             RETURNING journey_stage, last_intent, version, last_received_at, last_message_id,
-                      skill_id, structured_state::text;
+                      skill_id, structured_state::text, session_started_at;
             """;
 
         ConversationCheckpoint? checkpoint = null;
@@ -124,7 +124,8 @@ public sealed class PostgresMessageInboxStore(
                     reader.IsDBNull(3) ? null : reader.GetFieldValue<DateTimeOffset>(3),
                     reader.IsDBNull(4) ? null : reader.GetString(4),
                     reader.IsDBNull(5) ? null : reader.GetString(5),
-                    reader.IsDBNull(6) ? null : reader.GetString(6));
+                    reader.IsDBNull(6) ? null : reader.GetString(6),
+                    reader.IsDBNull(7) ? null : reader.GetFieldValue<DateTimeOffset>(7));
             }
         }
 
@@ -179,6 +180,7 @@ public sealed class PostgresMessageInboxStore(
                 last_message_id = @message_id,
                 skill_id = @skill_id,
                 structured_state = @structured_state::jsonb,
+                session_started_at = @session_started_at,
                 processing_message_id = NULL,
                 processing_lease_until = NULL,
                 updated_at = now()
@@ -197,6 +199,7 @@ public sealed class PostgresMessageInboxStore(
             updateState.Parameters.AddWithValue("message_id", command.MessageId);
             updateState.Parameters.AddWithValue("skill_id", (object?)command.SkillId ?? DBNull.Value);
             updateState.Parameters.AddWithValue("structured_state", command.StructuredState ?? "{}");
+            updateState.Parameters.AddWithValue("session_started_at", (object?)command.SessionStartedAt ?? DBNull.Value);
             updateState.Parameters.AddWithValue("expected_version", command.ExpectedVersion);
             var updated = await updateState.ExecuteNonQueryAsync(cancellationToken);
             if (updated != 1)
@@ -513,6 +516,8 @@ public sealed class PostgresMessageInboxStore(
                 ALTER TABLE ops.conversation_state DROP COLUMN IF EXISTS active_agreement_id;
                 ALTER TABLE ops.conversation_state ADD COLUMN IF NOT EXISTS skill_id text;
                 ALTER TABLE ops.conversation_state ADD COLUMN IF NOT EXISTS structured_state jsonb NOT NULL DEFAULT '{}'::jsonb;
+                ALTER TABLE ops.conversation_state ADD COLUMN IF NOT EXISTS session_started_at timestamptz;
+                UPDATE ops.conversation_state SET session_started_at = created_at WHERE session_started_at IS NULL;
 
                 CREATE TABLE IF NOT EXISTS ops.orchestrator_outbox (
                     outbox_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

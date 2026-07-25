@@ -30,6 +30,12 @@ public class IngestMessageUseCase(
     /// state" requirement.</summary>
     public const string HandoffRequestedState = "HandoffRequested";
 
+    /// <summary>A conversation's session is capped at 15 minutes from its own start, not an
+    /// inactivity timeout - see journey-state-machine's session-window requirement. Owned by the
+    /// orchestrator itself (like HandoffRequestedState above) since it's about conversation
+    /// lifecycle, not any skill's own vocabulary.</summary>
+    private static readonly TimeSpan SessionDuration = TimeSpan.FromMinutes(15);
+
     public async Task<IngestMessageResult> ExecuteAsync(
         InboundChannelMessage message,
         CancellationToken cancellationToken)
@@ -74,7 +80,20 @@ public class IngestMessageUseCase(
 
         try
         {
+            var now = DateTimeOffset.UtcNow;
             var previousState = checkpoint.State;
+            // Anchored to the session's own start, not the last message - a customer who keeps
+            // messaging every few minutes still gets reset at 15 minutes total, same as one who
+            // goes quiet. LastReceivedAt is only a fallback for a checkpoint that predates this
+            // column (backfilled to created_at at migration time, but defensive here too).
+            var sessionStartedAt = checkpoint.SessionStartedAt ?? checkpoint.LastReceivedAt ?? now;
+            var sessionExpired = now - sessionStartedAt > SessionDuration;
+            var nextSessionStartedAt = sessionExpired ? now : sessionStartedAt;
+            if (sessionExpired)
+            {
+                metrics.Increment("orchestrator_session_resets_total");
+            }
+
             var skillId = checkpoint.SkillId ?? agentSkillRegistry.ResolveTenantSkill(tenantContext.TenantId);
             var agentClient = skillId is not null ? agentSkillRegistry.Resolve(skillId) : null;
 
@@ -126,10 +145,15 @@ public class IngestMessageUseCase(
                         // we're calling the agent again anyway, that already means we're routing
                         // back to it rather than a human - give it a clean slate instead of a state
                         // it can't act on, so it has a real chance to make progress this turn.
-                        State = previousState == HandoffRequestedState ? null : previousState,
+                        // A session past its 15-minute window gets the same clean slate, for the
+                        // same reason: whatever state/identity it resolved belongs to a session
+                        // that's now over.
+                        State = (previousState == HandoffRequestedState || sessionExpired) ? null : previousState,
                         JourneyVersion = checkpoint.Version,
                         LastIntent = checkpoint.LastIntent,
-                        StructuredState = priorStructuredState
+                        StructuredState = sessionExpired ? null : priorStructuredState,
+                        SessionReset = sessionExpired,
+                        SessionStartedAt = nextSessionStartedAt
                     },
                     cancellationToken);
             }
@@ -141,14 +165,19 @@ public class IngestMessageUseCase(
             var nextIntent = result.Intent ?? checkpoint.LastIntent;
             // The resolved agent already echoes back the previous StructuredState when it has
             // nothing new to report - this fallback only matters for a synthetic/unavailable
-            // result, which has no way to know what the checkpoint held.
+            // result, or a session-reset turn where the agent made no progress of its own (e.g.
+            // it just asked for the CPF again), neither of which has a legitimate prior
+            // StructuredState to fall back to.
             var nextStructuredState = result.StructuredState is not null
                 ? result.StructuredState.RootElement.GetRawText()
-                : checkpoint.StructuredState;
+                : (sessionExpired ? null : checkpoint.StructuredState);
             var nextSkillId = skillId ?? checkpoint.SkillId;
+            // Same reasoning as StructuredState above: a session-reset turn where the agent
+            // reports no new State of its own must land on a real clean slate (Started), not
+            // fall back to whatever stage the *expired* session had reached.
             var nextState = result.RequiresHandoff
                 ? HandoffRequestedState
-                : (result.State ?? previousState);
+                : (result.State ?? (sessionExpired ? ConversationCheckpoint.StartedState : previousState));
 
             if (!result.RequiresHandoff && nextState != previousState)
             {
@@ -159,7 +188,6 @@ public class IngestMessageUseCase(
                     ("outcome", "applied"));
             }
 
-            var now = DateTimeOffset.UtcNow;
             var outcome = result.RequiresHandoff ? "handoff" : "processed";
             var effects = BuildDurableEffects(
                 tenantId,
@@ -183,7 +211,8 @@ public class IngestMessageUseCase(
                     checkpoint.Version,
                     effects,
                     nextSkillId,
-                    nextStructuredState),
+                    nextStructuredState,
+                    nextSessionStartedAt),
                 cancellationToken);
 
             metrics.Increment("orchestrator_journey_outcomes_total", ("outcome", outcome));
