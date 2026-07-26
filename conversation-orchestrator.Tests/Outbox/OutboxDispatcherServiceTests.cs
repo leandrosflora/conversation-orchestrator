@@ -92,6 +92,11 @@ public class OutboxDispatcherServiceTests
         public Task SendReplyAsync(
             string conversationId, string replyText, string idempotencyKey, CancellationToken cancellationToken) =>
             throw exception;
+
+        public Task SendMenuAsync(
+            string conversationId, string bodyText, IReadOnlyList<MenuOption> options, string idempotencyKey,
+            CancellationToken cancellationToken) =>
+            throw exception;
     }
 
     private sealed class FakeOutboxStore(List<OutboxEnvelope> pending) : IOutboxStore

@@ -186,6 +186,17 @@ public sealed class OutboxDispatcherService(
                     cancellationToken);
                 return;
             }
+            case OutboxEffectTypes.ChannelMenu:
+            {
+                var payload = Deserialize<ChannelMenuEffect>(envelope.Payload);
+                await services.GetRequiredService<IChannelReplyClient>().SendMenuAsync(
+                    payload.ConversationId,
+                    payload.BodyText,
+                    payload.Options,
+                    envelope.IdempotencyKey,
+                    cancellationToken);
+                return;
+            }
             case OutboxEffectTypes.HandoffRequest:
             {
                 var payload = Deserialize<HandoffRequestEffect>(envelope.Payload);
