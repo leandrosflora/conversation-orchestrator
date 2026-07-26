@@ -25,16 +25,24 @@ public class AgentSkillEntry
     /// only correct if the two happen to match.
     /// </summary>
     public string? DownstreamServiceName { get; set; }
+
+    /// <summary>
+    /// The WhatsApp interactive-button id/label used in the flow-selection menu shown when a
+    /// tenant has more than one assigned skill and none is pinned yet. Unused (may stay unset)
+    /// for a tenant with only one assigned skill, since that skill auto-pins with no menu shown.
+    /// </summary>
+    public string? SelectionButtonId { get; set; }
+    public string? SelectionButtonTitle { get; set; }
 }
 
 /// <summary>
-/// Maps a tenant id to the skill id that handles its conversations. V1 is tenant-scoped only
-/// (one skill per tenant) - see design.md's Open Questions for routing by channel identity once
-/// a tenant needs more than one skill.
+/// Maps a tenant id to the skill ids assigned to it, in menu-display order. A single assigned
+/// skill auto-pins with no menu shown, preserving today's UX. Two or more trigger the
+/// flow-selection menu on a session with no skill pinned yet - see agent-skill-registry.
 /// </summary>
 public class TenantSkillOptions
 {
     public const string SectionName = "TenantSkillAssignments";
 
-    public Dictionary<string, string> Assignments { get; set; } = new();
+    public Dictionary<string, List<string>> Assignments { get; set; } = new();
 }

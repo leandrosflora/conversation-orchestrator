@@ -21,8 +21,8 @@ public sealed class AgentSkillRegistry(
 {
     public static string HttpClientName(string skillId) => $"agent-skill:{skillId}";
 
-    public string? ResolveTenantSkill(string tenantId) =>
-        tenantOptions.Value.Assignments.GetValueOrDefault(tenantId);
+    public IReadOnlyList<string> ResolveTenantSkills(string tenantId) =>
+        tenantOptions.Value.Assignments.GetValueOrDefault(tenantId) ?? [];
 
     public IAgentRuntimeClient? Resolve(string skillId)
     {
@@ -35,4 +35,12 @@ public sealed class AgentSkillRegistry(
         var httpClient = httpClientFactory.CreateClient(HttpClientName(skillId));
         return new AgentRuntimeClient(httpClient, metrics, agentClientLogger);
     }
+
+    public IReadOnlyList<AgentSkillEntry> GetSkillEntries(IReadOnlyList<string> skillIds) =>
+        skillOptions.Value.Skills.Where(s => skillIds.Contains(s.Id)).ToList();
+
+    public string? ResolveSkillIdBySelectionButton(IReadOnlyList<string> skillIds, string buttonId) =>
+        skillOptions.Value.Skills
+            .FirstOrDefault(s => skillIds.Contains(s.Id) && s.SelectionButtonId == buttonId)
+            ?.Id;
 }

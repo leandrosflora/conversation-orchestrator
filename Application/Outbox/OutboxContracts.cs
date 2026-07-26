@@ -8,6 +8,7 @@ public static class OutboxEffectTypes
     public const string MemoryAppendMessage = "memory.append_message";
     public const string MemorySaveSession = "memory.save_session";
     public const string ChannelReply = "channel.reply";
+    public const string ChannelMenu = "channel.menu";
     public const string HandoffRequest = "handoff.request";
     public const string AuditRecord = "audit.record";
     public const string IntentDetected = "kafka.intent_detected";
@@ -28,6 +29,11 @@ public sealed record MemorySaveSessionEffect(
     string? LastIntent);
 
 public sealed record ChannelReplyEffect(string ConversationId, string ReplyText);
+
+public sealed record ChannelMenuEffect(
+    string ConversationId,
+    string BodyText,
+    IReadOnlyList<MenuOption> Options);
 
 public sealed record HandoffRequestEffect(string ConversationId, string Reason);
 

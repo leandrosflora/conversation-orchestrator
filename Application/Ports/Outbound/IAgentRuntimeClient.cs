@@ -37,6 +37,9 @@ public class AgentRuntimeRequest
     public DateTimeOffset? SessionStartedAt { get; init; }
 }
 
+/// <summary>A single WhatsApp interactive-button option in a flow-selection menu.</summary>
+public sealed record MenuOption(string Id, string Title);
+
 public class AgentRuntimeResult
 {
     public const string AgentRuntimeUnavailableReason = "agent_runtime_unavailable";
@@ -45,6 +48,10 @@ public class AgentRuntimeResult
     /// is no longer) in the configured agent-skill-registry list.</summary>
     public const string SkillNotConfiguredReason = "skill_not_configured";
 
+    /// <summary>The resolved agent reported the customer's message as out of its own skill's
+    /// scope, and no other skill was configured for the tenant to fall back to.</summary>
+    public const string OutOfScopeNoAlternativeSkillReason = "out_of_scope_no_alternative_skill";
+
     public string? Intent { get; init; }
     public double Confidence { get; init; }
     public string? ReplyText { get; init; }
@@ -52,6 +59,16 @@ public class AgentRuntimeResult
     public string? HandoffReason { get; init; }
     public string? State { get; init; }
     public JsonDocument? StructuredState { get; init; }
+
+    /// <summary>True when the resolved agent judged the customer's message to be outside its own
+    /// skill's domain (e.g. a renegotiation agent receiving a card-invoice question). Only
+    /// meaningful for a real agent call - never set on a synthetic result.</summary>
+    public bool OutOfScope { get; init; }
+
+    /// <summary>Non-null only for an orchestrator-synthesized "show the flow-selection menu"
+    /// result - see agent-skill-registry. ReplyText carries the menu's body text in that case.
+    /// Never set by a real agent call.</summary>
+    public IReadOnlyList<MenuOption>? MenuOptions { get; init; }
 
     public static AgentRuntimeResult Unavailable() => new()
     {

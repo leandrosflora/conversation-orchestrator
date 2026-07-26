@@ -10,6 +10,7 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 using Moq;
 using conversation_orchestrator.Application.Outbox;
 using conversation_orchestrator.Application.Ports.Outbound;
+using conversation_orchestrator.Configuration;
 using conversation_orchestrator.Domain;
 using conversation_orchestrator.Tests.Testing;
 using Xunit;
@@ -682,6 +683,260 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
             Times.Once);
     }
 
+    [Fact]
+    public async Task PostMessages_MultiSkillTenantFreshConversation_SendsMenuWithoutCallingAnyAgent()
+    {
+        var agentRuntime = new Mock<IAgentRuntimeClient>();
+        var reply = new Mock<IChannelReplyClient>();
+        var entries = new List<AgentSkillEntry>
+        {
+            new() { Id = "renegotiation", SelectionButtonId = "skill_renegotiation", SelectionButtonTitle = "Renegociar dívidas" },
+            new() { Id = "cartao-credito", SelectionButtonId = "skill_cartao", SelectionButtonTitle = "Fatura do cartão" }
+        };
+        var client = CreateClient(
+            agentRuntime.Object,
+            replyClient: reply.Object,
+            skillRegistry: new StubAgentSkillRegistry(
+                client: agentRuntime.Object,
+                tenantSkillId: null,
+                tenantSkillIds: ["renegotiation", "cartao-credito"],
+                skillEntries: entries));
+
+        var response = await client.PostAsJsonAsync("/messages", new
+        {
+            MessageId = "wamid.menu-1",
+            From = "5511999990000",
+            ConversationId = "5511999990000",
+            Type = 0,
+            Text = "Oi",
+            ReceivedAt = DateTimeOffset.UtcNow
+        });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        agentRuntime.Verify(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+        reply.Verify(
+            r => r.SendMenuAsync(
+                "5511999990000",
+                It.IsAny<string>(),
+                It.Is<IReadOnlyList<MenuOption>>(o => o.Count == 2
+                    && o.Any(x => x.Id == "skill_renegotiation")
+                    && o.Any(x => x.Id == "skill_cartao")),
+                It.IsAny<string>(),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task PostMessages_MultiSkillTenantSelectionButtonTap_PinsSkillAndCallsItsAgent()
+    {
+        var agentRuntime = new Mock<IAgentRuntimeClient>();
+        agentRuntime
+            .Setup(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new AgentRuntimeResult { Intent = "consultar_fatura", ReplyText = "Sua fatura é...", RequiresHandoff = false });
+        var client = CreateClient(
+            agentRuntime.Object,
+            skillRegistry: new StubAgentSkillRegistry(
+                client: agentRuntime.Object,
+                tenantSkillId: null,
+                tenantSkillIds: ["renegotiation", "cartao-credito"],
+                selectionButtonSkillId: "cartao-credito"));
+
+        var response = await client.PostAsJsonAsync("/messages", new
+        {
+            MessageId = "wamid.menu-2",
+            From = "5511999990000",
+            ConversationId = "5511999990000",
+            Type = 1,
+            Interactive = new { Id = "skill_cartao", Title = "Fatura do cartão" },
+            ReceivedAt = DateTimeOffset.UtcNow
+        });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        agentRuntime.Verify(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task PostMessages_SkillJustPinnedFromAwaitingSkillSelection_DoesNotLeakReservedStateToAgent()
+    {
+        // Reproduces a live bug: a customer taps a menu button, pinning a skill while State is
+        // still the reserved AwaitingSkillSelection value (the resolved agent hasn't reported its
+        // own State yet). The very next turn, before the resolved agent has produced a real
+        // milestone of its own, must not echo AwaitingSkillSelection back to that agent as its own
+        // journey_stage/State - confirmed live this left every governed tool at the resolved
+        // skill's own tool-service permanently stage-denied (it never recognized this reserved
+        // value as an allowed stage), so a customer who just picked "renegotiation" could never
+        // get past giving their CPF on any later turn either.
+        AgentRuntimeRequest? capturedRequest = null;
+        var agentRuntime = new Mock<IAgentRuntimeClient>();
+        agentRuntime
+            .Setup(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
+            .Callback<AgentRuntimeRequest, CancellationToken>((request, _) => capturedRequest = request)
+            .ReturnsAsync(new AgentRuntimeResult
+            {
+                Intent = "solicitar_cpf",
+                ReplyText = "Pode informar seu CPF?",
+                RequiresHandoff = false
+                // No State reported - mirrors a real turn where the agent asked for identification
+                // again without yet reaching a milestone of its own.
+            });
+        ConversationSession? saved = null;
+        var memoryClient = new Mock<IConversationMemoryClient>();
+        memoryClient
+            .Setup(c => c.GetOrCreateSessionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string conversationId, CancellationToken _) => new ConversationSession
+            {
+                ConversationId = conversationId,
+                CreatedAt = DateTimeOffset.UtcNow,
+                LastMessageAt = DateTimeOffset.UtcNow,
+                JourneyStage = "AwaitingSkillSelection"
+            });
+        memoryClient
+            .Setup(c => c.SaveSessionAsync(It.IsAny<ConversationSession>(), It.IsAny<CancellationToken>()))
+            .Callback<ConversationSession, CancellationToken>((session, _) => saved = session)
+            .Returns(Task.CompletedTask);
+        var client = CreateClient(
+            agentRuntime.Object,
+            conversationMemoryClient: memoryClient.Object,
+            skillRegistry: new StubAgentSkillRegistry(
+                client: agentRuntime.Object,
+                tenantSkillId: null,
+                tenantSkillIds: ["renegotiation", "cartao-credito"]),
+            seedConversationId: "5511999990000",
+            seedState: "AwaitingSkillSelection",
+            seedSkillId: "renegotiation");
+
+        var response = await client.PostAsJsonAsync("/messages", new
+        {
+            MessageId = "wamid.stuck-state-1",
+            From = "5511999990000",
+            ConversationId = "5511999990000",
+            Type = 0,
+            Text = "meu cpf e 11111111111",
+            ReceivedAt = DateTimeOffset.UtcNow
+        });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        Assert.NotNull(capturedRequest);
+        // Must not leak the orchestrator-reserved state to the resolved skill's own agent.
+        Assert.Null(capturedRequest!.State);
+        // Must not get stuck at the reserved value either, once the agent produced no State of
+        // its own this turn - the next turn needs a real clean slate (Started), not another round
+        // of the same poisoned value.
+        Assert.NotNull(saved);
+        Assert.Equal("Started", saved!.JourneyStage);
+    }
+
+    [Fact]
+    public async Task PostMessages_OutOfScopeWithAlternativeSkill_ResetsAndShowsMenuInstead()
+    {
+        var agentRuntime = new Mock<IAgentRuntimeClient>();
+        agentRuntime
+            .Setup(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new AgentRuntimeResult
+            {
+                ReplyText = "Isso foge do meu escopo",
+                RequiresHandoff = false,
+                OutOfScope = true,
+                State = "CustomerIdentified"
+            });
+        var reply = new Mock<IChannelReplyClient>();
+        ConversationSession? saved = null;
+        var memoryClient = new Mock<IConversationMemoryClient>();
+        memoryClient
+            .Setup(c => c.GetOrCreateSessionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string conversationId, CancellationToken _) => new ConversationSession
+            {
+                ConversationId = conversationId,
+                CreatedAt = DateTimeOffset.UtcNow,
+                LastMessageAt = DateTimeOffset.UtcNow,
+                JourneyStage = "renegotiation"
+            });
+        memoryClient
+            .Setup(c => c.SaveSessionAsync(It.IsAny<ConversationSession>(), It.IsAny<CancellationToken>()))
+            .Callback<ConversationSession, CancellationToken>((session, _) => saved = session)
+            .Returns(Task.CompletedTask);
+        var entries = new List<AgentSkillEntry>
+        {
+            new() { Id = "renegotiation", SelectionButtonId = "skill_renegotiation", SelectionButtonTitle = "Renegociar dívidas" },
+            new() { Id = "cartao-credito", SelectionButtonId = "skill_cartao", SelectionButtonTitle = "Fatura do cartão" }
+        };
+        var client = CreateClient(
+            agentRuntime.Object,
+            replyClient: reply.Object,
+            conversationMemoryClient: memoryClient.Object,
+            skillRegistry: new StubAgentSkillRegistry(
+                client: agentRuntime.Object,
+                tenantSkillId: null,
+                tenantSkillIds: ["renegotiation", "cartao-credito"],
+                skillEntries: entries),
+            seedConversationId: "5511999990000",
+            seedState: "renegotiation");
+
+        var response = await client.PostAsJsonAsync("/messages", new
+        {
+            MessageId = "wamid.menu-3",
+            From = "5511999990000",
+            ConversationId = "5511999990000",
+            Type = 0,
+            Text = "Quero saber minha fatura do cartão",
+            ReceivedAt = DateTimeOffset.UtcNow
+        });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        // The agent's own reported State (CustomerIdentified) is discarded - out-of-scope with an
+        // alternative skill available lands on the reserved AwaitingSkillSelection state instead.
+        Assert.NotNull(saved);
+        Assert.Equal("AwaitingSkillSelection", saved!.JourneyStage);
+        reply.Verify(
+            r => r.SendMenuAsync(
+                "5511999990000",
+                It.IsAny<string>(),
+                It.IsAny<IReadOnlyList<MenuOption>>(),
+                It.IsAny<string>(),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+        reply.Verify(
+            r => r.SendReplyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task PostMessages_OutOfScopeWithNoAlternativeSkill_RequestsHandoffInstead()
+    {
+        var agentRuntime = new Mock<IAgentRuntimeClient>();
+        agentRuntime
+            .Setup(a => a.ProcessAsync(It.IsAny<AgentRuntimeRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new AgentRuntimeResult
+            {
+                ReplyText = "Isso foge do meu escopo",
+                RequiresHandoff = false,
+                OutOfScope = true
+            });
+        var handoff = new Mock<IHandoffServiceClient>();
+        var client = CreateClient(
+            agentRuntime.Object,
+            handoffClient: handoff.Object,
+            skillRegistry: new StubAgentSkillRegistry(client: agentRuntime.Object, tenantSkillId: TestSkillId));
+
+        var response = await client.PostAsJsonAsync("/messages", new
+        {
+            MessageId = "wamid.menu-4",
+            From = "5511999990000",
+            ConversationId = "5511999990000",
+            Type = 0,
+            Text = "Algo bem fora do escopo",
+            ReceivedAt = DateTimeOffset.UtcNow
+        });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        handoff.Verify(
+            h => h.RequestHandoffAsync(
+                It.Is<HandoffRequest>(r => r.Reason == AgentRuntimeResult.OutOfScopeNoAlternativeSkillReason),
+                It.IsAny<string>(),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
     private HttpClient CreateClient(
         IAgentRuntimeClient agentRuntimeClient,
         IChannelReplyClient? replyClient = null,
@@ -693,7 +948,8 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
         IAgentSkillRegistry? skillRegistry = null,
         string? seedConversationId = null,
         string? seedState = null,
-        DateTimeOffset? seedSessionStartedAt = null)
+        DateTimeOffset? seedSessionStartedAt = null,
+        string? seedSkillId = null)
     {
         var reply = replyClient ?? Mock.Of<IChannelReplyClient>();
         var events = eventPublisher ?? Mock.Of<IConversationEventPublisher>();
@@ -727,7 +983,7 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
 
                 services.RemoveAll<IMessageInboxStore>();
                 services.AddSingleton(inboxStore ?? new InMemoryMessageInboxStore(
-                    reply, events, handoff, audit, memory, seedConversationId, seedState, seedSessionStartedAt));
+                    reply, events, handoff, audit, memory, seedConversationId, seedState, seedSessionStartedAt, seedSkillId));
             });
         });
 
@@ -741,10 +997,20 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
     /// ever exercises one skill at a time, so a full multi-skill registry stub isn't needed (see
     /// AgentSkillRegistryTests for coverage of the real AgentSkillRegistry's resolution logic
     /// itself). Pass client: null to simulate an unconfigured skill.</summary>
-    private sealed class StubAgentSkillRegistry(IAgentRuntimeClient? client, string? tenantSkillId) : IAgentSkillRegistry
+    private sealed class StubAgentSkillRegistry(
+        IAgentRuntimeClient? client,
+        string? tenantSkillId,
+        IReadOnlyList<string>? tenantSkillIds = null,
+        IReadOnlyList<AgentSkillEntry>? skillEntries = null,
+        string? selectionButtonSkillId = null) : IAgentSkillRegistry
     {
-        public string? ResolveTenantSkill(string tenantId) => tenantSkillId;
+        public IReadOnlyList<string> ResolveTenantSkills(string tenantId) =>
+            tenantSkillIds ?? (tenantSkillId is not null ? [tenantSkillId] : []);
         public IAgentRuntimeClient? Resolve(string skillId) => client;
+        public IReadOnlyList<AgentSkillEntry> GetSkillEntries(IReadOnlyList<string> skillIds) =>
+            skillEntries ?? [];
+        public string? ResolveSkillIdBySelectionButton(IReadOnlyList<string> skillIds, string buttonId) =>
+            selectionButtonSkillId;
     }
 
     /// <summary>Minimal in-memory stand-in for PostgresMessageInboxStore + OutboxDispatcherService,
@@ -764,7 +1030,8 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
         IConversationMemoryClient memoryClient,
         string? seedConversationId = null,
         string? seedState = null,
-        DateTimeOffset? seedSessionStartedAt = null) : IMessageInboxStore
+        DateTimeOffset? seedSessionStartedAt = null,
+        string? seedSkillId = null) : IMessageInboxStore
     {
         private readonly HashSet<string> _completed = new();
         private readonly HashSet<string> _inProgress = new();
@@ -773,7 +1040,7 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
                 ? new()
                 {
                     [seedConversationId] = new ConversationCheckpoint(
-                        seedState, null, 0, null, null, null, null, seedSessionStartedAt)
+                        seedState, null, 0, null, null, seedSkillId, null, seedSessionStartedAt)
                 }
                 : new();
 
@@ -862,6 +1129,13 @@ public class MessageIngestionEndpointsTests : IClassFixture<WebApplicationFactor
                     var payload = Deserialize<ChannelReplyEffect>(effect.Payload);
                     await replyClient.SendReplyAsync(
                         payload.ConversationId, payload.ReplyText, effect.IdempotencyKey, cancellationToken);
+                    return;
+                }
+                case OutboxEffectTypes.ChannelMenu:
+                {
+                    var payload = Deserialize<ChannelMenuEffect>(effect.Payload);
+                    await replyClient.SendMenuAsync(
+                        payload.ConversationId, payload.BodyText, payload.Options, effect.IdempotencyKey, cancellationToken);
                     return;
                 }
                 case OutboxEffectTypes.HandoffRequest:
