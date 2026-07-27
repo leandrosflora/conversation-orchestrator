@@ -1,0 +1,31 @@
+name: Supply chain
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: supply-chain-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Dependency, secret and configuration scanning is enforced by the reusable Trivy gate.
+  # SARIF blocks only HIGH and CRITICAL findings; LOW findings remain visible as evidence.
+  # OCI archives are exported by the reusable Buildx gate.
+  supply-chain:
+    uses: leandrosflora/conversational-ai-platform-architecture/.github/workflows/reusable-service-supply-chain.yml@main
+    with:
+      service_name: conversation-orchestrator
+      language: csharp
+      dockerfile: Dockerfile
