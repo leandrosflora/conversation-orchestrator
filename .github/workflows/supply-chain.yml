@@ -21,6 +21,7 @@ concurrency:
 
 jobs:
   # Dependency, secret and configuration scanning is enforced by the reusable Trivy gate.
+  # SARIF blocks only HIGH and CRITICAL findings; LOW findings remain visible as evidence.
   supply-chain:
     uses: leandrosflora/conversational-ai-platform-architecture/.github/workflows/reusable-service-supply-chain.yml@main
     with:
