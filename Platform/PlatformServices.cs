@@ -10,6 +10,7 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
 using Npgsql;
+using conversation_orchestrator.Configuration;
 using JsonWebToken = Microsoft.IdentityModel.JsonWebTokens.JsonWebToken;
 
 namespace conversation_orchestrator.Platform;
@@ -399,6 +400,10 @@ public static class PlatformServiceExtensions
                 IOptions<InternalAuthOptions> authOptions,
                 NpgsqlDataSource dataSource,
                 IAdminClient adminClient,
+                IHttpClientFactory httpClientFactory,
+                IOptions<ConversationMemoryOptions> conversationMemoryOptions,
+                IOptions<HandoffServiceOptions> handoffServiceOptions,
+                IOptions<AuditServiceOptions> auditServiceOptions,
                 CancellationToken cancellationToken) =>
             {
                 var failures = new List<string>();
@@ -443,6 +448,39 @@ public static class PlatformServiceExtensions
                 catch
                 {
                     failures.Add("kafka_unavailable");
+                }
+
+                // These three back the durable outbox effects every inbound message produces
+                // (memory.append_message/save_session, handoff.request, audit.record). None of
+                // them being down stops the process from reporting "ready" via Postgres/Kafka
+                // alone, while messages silently pile up retrying in the outbox - this caught us
+                // once already (conversation-memory-service was dead for 40+ minutes with no
+                // signal). A short unauthenticated GET to /health/live is enough to catch that.
+                var dependencyChecks = new (string Name, string BaseUrl)[]
+                {
+                    ("conversation_memory_service", conversationMemoryOptions.Value.BaseUrl),
+                    ("conversation_handoff_service", handoffServiceOptions.Value.BaseUrl),
+                    ("conversation_audit_service", auditServiceOptions.Value.BaseUrl)
+                };
+
+                foreach (var (name, baseUrl) in dependencyChecks)
+                {
+                    try
+                    {
+                        using var client = httpClientFactory.CreateClient();
+                        client.Timeout = TimeSpan.FromSeconds(3);
+                        using var response = await client.GetAsync(
+                            new Uri(new Uri(baseUrl), "/health/live"),
+                            cancellationToken);
+                        if (!response.IsSuccessStatusCode)
+                        {
+                            failures.Add($"{name}_unavailable");
+                        }
+                    }
+                    catch
+                    {
+                        failures.Add($"{name}_unavailable");
+                    }
                 }
 
                 return failures.Count == 0
