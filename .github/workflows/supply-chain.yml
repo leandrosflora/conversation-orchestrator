@@ -20,6 +20,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Dependency, secret and configuration scanning is enforced by the reusable Trivy gate.
   supply-chain:
     uses: leandrosflora/conversational-ai-platform-architecture/.github/workflows/reusable-service-supply-chain.yml@main
     with:
