@@ -30,10 +30,18 @@ public sealed class OutboxDispatcherService(
     // signal.
     private static readonly TimeSpan ParkedRetryDelay = TimeSpan.FromDays(3650);
 
+    // Staleness is sampled on a slower cadence than the (often 1s) claim loop: it's a diagnostic
+    // gauge, not something the hot path needs fresh every tick, and running an extra aggregate
+    // query every idle poll would add load for no benefit.
+    private static readonly TimeSpan StalenessSampleInterval = TimeSpan.FromSeconds(15);
+    private DateTimeOffset _lastStalenessSampleAt = DateTimeOffset.MinValue;
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         while (!stoppingToken.IsCancellationRequested)
         {
+            await SampleStalenessIfDueAsync(stoppingToken);
+
             IReadOnlyList<OutboxEnvelope> batch;
             try
             {
@@ -61,6 +69,31 @@ public sealed class OutboxDispatcherService(
             {
                 await DispatchOneAsync(envelope, stoppingToken);
             }
+        }
+    }
+
+    private async Task SampleStalenessIfDueAsync(CancellationToken cancellationToken)
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (now - _lastStalenessSampleAt < StalenessSampleInterval)
+        {
+            return;
+        }
+        _lastStalenessSampleAt = now;
+
+        try
+        {
+            var age = await outboxStore.GetOldestUnresolvedEffectAgeAsync(cancellationToken);
+            metrics.SetGauge("orchestrator_outbox_oldest_unresolved_seconds", age?.TotalSeconds ?? 0);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Best-effort: a failure to sample the staleness gauge must never block dispatching.
+            logger.LogError(ex, "Failed to sample orchestrator outbox staleness");
         }
     }
 
