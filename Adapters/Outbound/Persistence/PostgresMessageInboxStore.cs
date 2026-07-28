@@ -293,11 +293,19 @@ public sealed class PostgresMessageInboxStore(
         // ~10 years out per ParkedRetryDelay) is terminal, not in-flight - it must not block later
         // journey_versions of the same conversation forever. Only a predecessor still due for a
         // real retry soon (or actively pending/publishing) keeps blocking.
+        //
+        // 'publishing' is included here (not just 'pending'/'failed') so a row whose dispatcher
+        // died mid-flight - crash, OOM kill, or a host stop between the claim UPDATE and the
+        // matching MarkPublishedAsync/MarkFailedAsync - gets reclaimed once its lock expires
+        // instead of sitting orphaned forever. Without this, that single stuck row permanently
+        // blocks every later journey_version of its conversation via the predecessor check below
+        // (see incident 2026-07-26/2026-07-28). locked_until still gates it exactly like
+        // 'pending'/'failed': only claimable once the lease has actually expired.
         const string sql = """
             WITH candidates AS (
                 SELECT candidate.outbox_id
                 FROM ops.orchestrator_outbox candidate
-                WHERE candidate.status IN ('pending', 'failed')
+                WHERE candidate.status IN ('pending', 'failed', 'publishing')
                   AND candidate.next_attempt_at <= now()
                   AND (candidate.locked_until IS NULL OR candidate.locked_until < now())
                   AND NOT EXISTS (

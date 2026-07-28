@@ -82,6 +82,55 @@ public sealed class PostgresMessageInboxStoreOutboxOrderingTests : IAsyncLifetim
     }
 
     /// <summary>
+    /// Regression coverage for the 2026-07-28 incident: OutboxDispatcherService claimed a batch
+    /// (status='publishing', locked_until in the future) and then died before ever calling
+    /// MarkPublishedAsync/MarkFailedAsync - e.g. a container restart mid-dispatch. The old
+    /// ClaimBatchAsync WHERE clause only reclaimed status IN ('pending','failed'), so once
+    /// locked_until elapsed the row was orphaned forever and permanently blocked every later
+    /// journey_version of the same conversation, with no error ever logged (ClaimBatchAsync just
+    /// returned an empty batch, indistinguishable from "nothing to do").
+    /// </summary>
+    [Fact]
+    public async Task OrphanedPublishingPredecessor_WithExpiredLease_IsReclaimedAndUnblocksLaterJourneyVersion()
+    {
+        var tenantId = Guid.NewGuid();
+        const string conversationId = "conv-orphaned-publishing";
+
+        var turn1OutboxId = Guid.Empty;
+        var turn2OutboxId = await RunTwoTurnsAsync(
+            tenantId,
+            conversationId,
+            afterTurn1Claimed: async envelope =>
+            {
+                turn1OutboxId = envelope.OutboxId;
+
+                // Simulate the dispatcher dying mid-flight: leave the row in 'publishing' (never
+                // reaches MarkPublishedAsync/MarkFailedAsync) but back-date its lease as if the
+                // claim lease from a previous, now-dead process had already expired.
+                await using var connection = await _dataSource.OpenConnectionAsync();
+                await using var command = new NpgsqlCommand(
+                    "UPDATE ops.orchestrator_outbox SET locked_until = now() - interval '1 minute' WHERE outbox_id = @outbox_id",
+                    connection);
+                command.Parameters.AddWithValue("outbox_id", envelope.OutboxId);
+                await command.ExecuteNonQueryAsync();
+            });
+
+        var firstReclaim = await _store.ClaimBatchAsync(10, TimeSpan.FromSeconds(90), CancellationToken.None);
+
+        // The orphaned turn-1 row itself must be reclaimable once its lease expired ...
+        Assert.Contains(firstReclaim, e => e.OutboxId == turn1OutboxId);
+        // ... but turn-2 is still blocked in this same pass: turn-1 is still 'publishing' (not
+        // yet resolved) as far as the predecessor check is concerned.
+        Assert.DoesNotContain(firstReclaim, e => e.OutboxId == turn2OutboxId);
+
+        await _store.MarkPublishedAsync(turn1OutboxId, CancellationToken.None);
+
+        var secondReclaim = await _store.ClaimBatchAsync(10, TimeSpan.FromSeconds(90), CancellationToken.None);
+
+        Assert.Contains(secondReclaim, e => e.OutboxId == turn2OutboxId);
+    }
+
+    /// <summary>
     /// Drives two conversation turns through the real Inbox/Outbox transaction, claims (and thus
     /// locks in 'publishing') the turn-1 effect, lets the caller decide how it resolves, then
     /// completes turn 2 and returns the journey_version=2 outbox id to assert against.
