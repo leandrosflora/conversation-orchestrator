@@ -131,5 +131,8 @@ public class OutboxDispatcherServiceTests
             await Task.Delay(timeout, cancellationToken);
             return false;
         }
+
+        public Task<TimeSpan?> GetOldestUnresolvedEffectAgeAsync(CancellationToken cancellationToken) =>
+            Task.FromResult<TimeSpan?>(null);
     }
 }

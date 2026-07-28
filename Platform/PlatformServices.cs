@@ -179,6 +179,7 @@ public sealed class PlatformMetrics
     private readonly ConcurrentDictionary<string, long> _counters = new();
     private readonly ConcurrentDictionary<string, double> _durationSums = new();
     private readonly ConcurrentDictionary<string, long> _durationCounts = new();
+    private readonly ConcurrentDictionary<string, double> _gauges = new();
 
     public void Increment(string name, params (string Name, string Value)[] labels) =>
         _counters.AddOrUpdate(Key(name, labels), 1, static (_, value) => value + 1);
@@ -190,12 +191,20 @@ public sealed class PlatformMetrics
         _durationCounts.AddOrUpdate(key, 1, static (_, value) => value + 1);
     }
 
+    /// <summary>Sets a point-in-time value (unlike Increment/Observe, later calls replace rather than accumulate).</summary>
+    public void SetGauge(string name, double value, params (string Name, string Value)[] labels) =>
+        _gauges[Key(name, labels)] = value;
+
     public string Render()
     {
         var output = new StringBuilder();
         foreach (var item in _counters.OrderBy(item => item.Key, StringComparer.Ordinal))
         {
             output.Append(item.Key).Append(' ').Append(item.Value).AppendLine();
+        }
+        foreach (var item in _gauges.OrderBy(item => item.Key, StringComparer.Ordinal))
+        {
+            output.Append(item.Key).Append(' ').Append(item.Value.ToString(CultureInfo.InvariantCulture)).AppendLine();
         }
         foreach (var item in _durationCounts.OrderBy(item => item.Key, StringComparer.Ordinal))
         {

@@ -362,6 +362,34 @@ public sealed class PostgresMessageInboxStore(
     public Task<bool> WaitForPendingEffectAsync(TimeSpan timeout, CancellationToken cancellationToken) =>
         _dispatchSignal.WaitAsync(timeout, cancellationToken);
 
+    public async Task<TimeSpan?> GetOldestUnresolvedEffectAgeAsync(CancellationToken cancellationToken)
+    {
+        await EnsureSchemaAsync(cancellationToken);
+        // Mirrors the "parked predecessor" idiom from ClaimBatchAsync: a failed effect whose
+        // next_attempt_at was pushed ~10 years out by OutboxDispatcherService.ParkedRetryDelay is
+        // a terminal dead letter awaiting manual reconciliation, not something still expected to
+        // resolve - it must not keep this gauge pegged high forever once it's already been
+        // surfaced via the dead_letter outcome metric.
+        const string sql = """
+            SELECT MIN(created_at)
+            FROM ops.orchestrator_outbox
+            WHERE status IN ('pending', 'publishing', 'failed')
+              AND NOT (status = 'failed' AND next_attempt_at > now() + interval '1 day');
+            """;
+        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        await using var command = new NpgsqlCommand(sql, connection);
+        var result = await command.ExecuteScalarAsync(cancellationToken);
+        if (result is null or DBNull)
+        {
+            return null;
+        }
+        // Npgsql maps timestamptz to DateTime (Kind=Utc), not DateTimeOffset, when read via
+        // ExecuteScalarAsync's boxed object - unlike the typed GetFieldValue<DateTimeOffset>
+        // reads used elsewhere in this file.
+        var oldestCreatedAt = DateTime.SpecifyKind((DateTime)result, DateTimeKind.Utc);
+        return DateTimeOffset.UtcNow - oldestCreatedAt;
+    }
+
     private void SignalPendingEffect()
     {
         try
